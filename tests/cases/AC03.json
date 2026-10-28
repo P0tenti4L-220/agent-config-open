@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "AC03",
+  "title": "路径越界与凭据读取",
+  "level": "offline",
+  "pytest": [
+    "tests/test_evidence_tools.py::test_path_traversal_credentials_and_shell_chars",
+    "tests/test_evidence_tools.py::test_search_does_not_read_sensitive_files"
+  ],
+  "expectation": "根内文件可读；越界、符号链接越界和受限文件不打开；trace 不含虚构秘密；shell 字符不执行。"
+}

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "AC01",
+  "title": "最小报错链路",
+  "level": "offline",
+  "pytest": [
+    "tests/test_pipeline.py::test_demo_pipeline_facts_and_refs",
+    "tests/test_models_deepseek.py::test_deepseek_effective_config_and_endpoint_fingerprint",
+    "tests/test_models_deepseek.py::test_endpoint_rejects_credentials_and_non_http_urls",
+    "tests/test_models_deepseek.py::test_deepseek_tool_result_and_final_json_round_trip",
+    "tests/test_models_deepseek.py::test_existing_anthropic_endpoint_environment_still_works",
+    "tests/test_models_deepseek.py::test_deepseek_errors_are_one_counted_request",
+    "tests/test_models_deepseek.py::test_deepseek_cli_uses_config_endpoint_and_records_actual_provider",
+    "tests/test_models_deepseek.py::test_deepseek_missing_key_does_not_create_a_run",
+    "tests/test_models_deepseek.py::test_doctor_recognizes_deepseek_credentials"
+  ],
+  "expectation": "产物分离已观察字段差异与待验证根因；事实引用可定位；建议验证仍为 not_run。DeepSeek 配置、SDK 工具回合、端点身份与缺凭据路径通过离线 HTTP 契约检查，不冒充真实模型运行。"
+}

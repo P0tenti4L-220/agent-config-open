@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "id": "HC13",
+  "title": "无聊天历史的接手走查",
+  "level": "human",
+  "source": "human_review",
+  "pytest": [],
+  "expectation": "只凭仓库入口、当前交接和产物识别目标、事实/假设、缺项与下一步；未人工走查保持 not_run。",
+  "status": "not_run"
+}

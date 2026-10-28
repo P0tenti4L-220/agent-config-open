@@ -1,0 +1,15 @@
+# Optional GitHub lookup: copy to local/config.toml and fill placeholders.
+# Model key: DEEPSEEK_API_KEY. GitHub token: GITHUB_PERSONAL_ACCESS_TOKEN.
+# Install the official GitHub MCP server separately; do not commit its binary.
+# The adapter expects the search_issues / issue_read schemas used by v1.8.0.
+# Check schema compatibility before changing server versions.
+provider = "deepseek"
+model = "deepseek-flash"
+credential_env = "DEEPSEEK_API_KEY"
+
+[mcp]
+enabled = true
+command = "github-mcp-server"
+args = ["stdio", "--read-only", "--tools", "search_issues,issue_read"]
+repo = "YOUR_OWNER/YOUR_REPO"
+token_env = "GITHUB_PERSONAL_ACCESS_TOKEN"

@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "HC05",
+  "title": "结构化 pytest 结果和执行异常",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_acceptance.py::test_structured_pytest_results_and_runner_errors"
+  ],
+  "expectation": "stdout 文本不改变判定；skip、collection error、超时、缺报告都有明确结果且保留全部尝试。",
+  "status": "not_run"
+}

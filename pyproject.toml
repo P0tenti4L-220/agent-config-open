@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.25,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-triage"
+version = "0.2.0"
+description = "Evidence-grounded error triage and context handoff agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "P0tenti4L-220" }]
+dependencies = [
+  "pydantic>=2.9,<3",
+  "mcp>=1.2,<2",
+  "anthropic>=0.40,<1",
+]
+
+[project.urls]
+Repository = "https://github.com/P0tenti4L-220/agent-config-open"
+Issues = "https://github.com/P0tenti4L-220/agent-config-open/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+agent-triage = "agent_triage.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_triage"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "live: requires real model credentials and network; not run by default",
+]

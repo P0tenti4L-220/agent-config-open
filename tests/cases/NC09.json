@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC09",
+  "title": "上下文围绕当前问题保留反证",
+  "level": "offline",
+  "pytest": [
+    "tests/test_investigation_claims.py::test_counterevidence_is_kept_first_and_omissions_carry_impact"
+  ],
+  "expectation": "反证优先于无关材料；预算不足时省略项带影响说明，不只停留在 trace。",
+  "status": "not_run"
+}

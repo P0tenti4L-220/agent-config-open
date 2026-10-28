@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "task_id": "TASK-ID",
+  "goal": "一句话说明这个开发任务要让用户得到什么",
+  "base_commit": "0000000000000000000000000000000000000000",
+  "observed_tree_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "allowed_paths": [
+    "src/agent_triage/example.py",
+    "tests/test_example.py"
+  ],
+  "requirement_ids": ["HC01"],
+  "completed": [],
+  "pending": ["实现行为并用当前版本证据验证"],
+  "changed_paths": [],
+  "checks": [
+    {
+      "check_id": "pytest-target",
+      "result_ref": null,
+      "status_at_handoff": "not_run"
+    }
+  ],
+  "blocked_by": [],
+  "known_risks": ["占位模板，未执行任何检查"],
+  "next_action": {
+    "action": "先运行与本任务对应的最小测试并保存退出码与产物",
+    "expected_evidence": "一条绑定当前树摘要的 pytest 结果，而不是文字声明"
+  },
+  "worktree_state": "dirty",
+  "updated_at": "2026-10-25T00:00:00+00:00"
+}

@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "HC01",
+  "title": "能力、检查、文档来源可解析",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_harness_catalog.py::test_capability_catalog_rejects_dangling_and_duplicate_checks"
+  ],
+  "expectation": "六项能力映射真实检查 ID；悬空/重复/未知检查与手填 pass 被指出；文档入口可解析。",
+  "status": "not_run"
+}

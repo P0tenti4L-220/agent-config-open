@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "AC06",
+  "title": "缺失证据和错误根因诱导",
+  "level": "offline",
+  "pytest": [
+    "tests/test_context.py::test_missing_evidence_stays_partial_and_is_corrected",
+    "tests/test_context.py::test_stale_evidence_is_excluded_from_current_context",
+    "tests/test_context.py::test_candidate_lessons_are_labelled_reference_not_fact"
+  ],
+  "expectation": "不编造缺失文件内容；旧结论保持假设；报告缺失证据；analysis_status=partial。"
+}

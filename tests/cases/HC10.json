@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "id": "HC10",
+  "title": "冻结五例的人工诊断试点",
+  "level": "human",
+  "source": "human_review",
+  "pytest": [],
+  "expectation": "五例覆盖三类 playbook；至少 4/5 下一步正确；失败项保留；结论只描述该小样本。",
+  "status": "not_run"
+}

@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC07",
+  "title": "finalize 拒绝与一次纠错上限",
+  "level": "offline",
+  "pytest": [
+    "tests/test_runner.py::test_missing_final_output_becomes_failed_after_one_correction"
+  ],
+  "expectation": "最终输出不合法时最多纠错一次；仍不合法则标记失败并停止，不无限重试。",
+  "status": "not_run"
+}

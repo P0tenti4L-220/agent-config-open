@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "id": "HC09",
+  "title": "真实模型到指定 GitHub issue 的完整链路",
+  "level": "live",
+  "source": "run_artifact",
+  "pytest": [],
+  "expectation": "真实运行产物证明模型请求、搜索、读取、证据展示与 claim 引用形成可回查链路；无凭据/未执行时 not_run。",
+  "status": "not_run"
+}

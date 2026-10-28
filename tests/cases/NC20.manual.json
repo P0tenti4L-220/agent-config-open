@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "id": "NC20.manual",
+  "title": "三类 playbook 人工走查",
+  "level": "human",
+  "source": "human_review",
+  "expectation": "结构化输出、工具失败、上下文交接三类样例由人工按 playbook 走查并记录理由。",
+  "status": "not_run"
+}

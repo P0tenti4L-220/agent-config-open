@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC17",
+  "title": "无关成功命令不能替代指定检查",
+  "level": "offline",
+  "pytest": [
+    "tests/test_feedback_v2.py::test_v2_unplanned_check_is_rejected"
+  ],
+  "expectation": "命令的 check_id 必须绑定到分析建议的检查；未绑定或无关成功命令不晋升。",
+  "status": "not_run"
+}

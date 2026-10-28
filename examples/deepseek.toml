@@ -1,0 +1,13 @@
+# Copy to local/config.toml. Never put API keys in this file.
+provider = "deepseek"
+model = "deepseek-flash"
+base_url = "https://api.deepseek.com/anthropic"
+credential_env = "DEEPSEEK_API_KEY"
+
+[budgets]
+max_model_requests = 8
+max_tool_attempts = 12
+total_seconds = 180
+
+[mcp]
+enabled = false

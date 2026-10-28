@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "id": "NC20",
+  "title": "三个 playbook 样例（父项聚合）",
+  "level": "human",
+  "source": "aggregate",
+  "children": [
+    "NC20.routing",
+    "NC20.manual"
+  ],
+  "expectation": "路由单测与人工走查分开；父项只在两者都通过时通过。",
+  "status": "not_run"
+}

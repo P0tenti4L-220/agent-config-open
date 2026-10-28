@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC06",
+  "title": "多个策略检查与 deny 优先",
+  "level": "offline",
+  "pytest": [
+    "tests/test_policy_lifecycle.py::test_deny_wins_and_both_checks_see_the_same_immutable_input"
+  ],
+  "expectation": "allow 与 deny 都执行并看到同一份不可变输入；deny 优先，工具不执行。",
+  "status": "not_run"
+}

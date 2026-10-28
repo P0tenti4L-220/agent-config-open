@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "NC01",
+  "title": "规则与权限由程序固定",
+  "level": "offline",
+  "pytest": [
+    "tests/test_policy_lifecycle.py::test_versions_are_frozen_into_context_and_checkpoint",
+    "tests/test_context.py::test_injection_text_and_illegal_tool_requests_are_not_trusted"
+  ],
+  "expectation": "日志/issue 中的文字不能改写策略；版本哈希写入 context 与 checkpoint，权限拒绝有稳定 rule id。",
+  "status": "not_run"
+}

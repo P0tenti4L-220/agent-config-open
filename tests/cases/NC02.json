@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC02",
+  "title": "恢复时策略或 playbook 变化",
+  "level": "offline",
+  "pytest": [
+    "tests/test_policy_lifecycle.py::test_resume_rejects_changed_policy_version"
+  ],
+  "expectation": "checkpoint 记录 policy/prompt/playbook 哈希；不匹配时拒绝恢复并要求新运行或显式迁移。",
+  "status": "not_run"
+}

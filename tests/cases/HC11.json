@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "HC11",
+  "title": "doctor 准备度与权限边界",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_doctor.py::test_doctor_readiness_and_no_side_effects"
+  ],
+  "expectation": "准确区分 ready/blocked/error；offline 不被未配置远端阻塞；不联网、不安装、不启动 MCP、不打印凭据。",
+  "status": "not_run"
+}

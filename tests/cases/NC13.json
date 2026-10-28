@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC13",
+  "title": "引用存在但语义不支持",
+  "level": "offline",
+  "pytest": [
+    "tests/test_investigation_claims.py::test_semantic_support_failure_is_not_rendered_as_pass"
+  ],
+  "expectation": "程序不自动给语义支持 pass；人工标 fail 时报告显示 fail，claim-support 与结构检查分离。",
+  "status": "not_run"
+}

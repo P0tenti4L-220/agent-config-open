@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "HC08",
+  "title": "外部复核绑定主张与证据",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_review.py::test_external_review_binding_and_staleness"
+  ],
+  "expectation": "合法导入显示来源；未知/重复/过期引用拒绝；未列主张保持 not_run；正文或证据变化令复核 stale。",
+  "status": "not_run"
+}

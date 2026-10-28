@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC15",
+  "title": "交接缺少下一步或反证缺口",
+  "level": "offline",
+  "pytest": [
+    "tests/test_investigation_claims.py::test_handoff_contract_requires_next_step_and_counter_gap"
+  ],
+  "expectation": "handoff-contract 检查 goal、下一步、反证/待确认问题、证据索引和版本字段。",
+  "status": "not_run"
+}

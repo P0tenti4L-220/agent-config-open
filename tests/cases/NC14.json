@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC14",
+  "title": "未知证据与随机 id",
+  "level": "offline",
+  "pytest": [
+    "tests/test_outputs_store.py::test_validate_accepts_valid_refs_and_fails_random_ids"
+  ],
+  "expectation": "随机或不存在的 evidence id 使 evidence-refs 失败；无关检查通过不能掩盖引用错误。",
+  "status": "not_run"
+}

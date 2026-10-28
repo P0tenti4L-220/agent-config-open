@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC16",
+  "title": "outcome 缺输出快照",
+  "level": "offline",
+  "pytest": [
+    "tests/test_feedback_v2.py::test_v2_missing_output_does_not_promote"
+  ],
+  "expectation": "v2 outcome 必须导入真实输出；缺失或空输出时经验保持 candidate，运行停在 awaiting_verification。",
+  "status": "not_run"
+}

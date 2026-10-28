@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC05",
+  "title": "before_tool 超时不执行工具",
+  "level": "offline",
+  "pytest": [
+    "tests/test_policy_lifecycle.py::test_before_tool_timeout_blocks_execution"
+  ],
+  "expectation": "策略检查超时会拒绝执行；超时/取消的结果没有进入证据存储。",
+  "status": "not_run"
+}

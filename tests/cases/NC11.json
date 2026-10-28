@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC11",
+  "title": "过期证据不能支撑最终结论",
+  "level": "offline",
+  "pytest": [
+    "tests/test_investigation_claims.py::test_stale_evidence_fails_reference_and_validate"
+  ],
+  "expectation": "过期证据被引用时 evidence-refs 失败，validate 不允许该次运行通过。",
+  "status": "not_run"
+}

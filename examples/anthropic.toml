@@ -1,0 +1,8 @@
+# Set model to an available Anthropic model ID before using this template.
+# Set ANTHROPIC_API_KEY in the environment, never in TOML.
+provider = "anthropic"
+model = "YOUR_ANTHROPIC_MODEL_ID"
+credential_env = "ANTHROPIC_API_KEY"
+
+[mcp]
+enabled = false

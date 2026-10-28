@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "id": "AC11",
+  "title": "重复事件与相似问题",
+  "level": "offline",
+  "pytest": ["tests/test_outputs_store.py::test_same_event_id_is_idempotent_and_new_event_counts"],
+  "expectation": "同 event_id 不增 occurrence；新事件计数增加；fingerprint 只形成候选；不自动合并/关闭。"
+}

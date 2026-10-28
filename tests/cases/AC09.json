@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "AC09",
+  "title": "MCP 协议与错误适配",
+  "level": "local_mcp_integration",
+  "pytest": [
+    "tests/integration/test_mcp.py::test_local_mcp_protocol_and_error_adapter",
+    "tests/integration/test_mcp.py::test_iserror_is_not_converted_to_empty_results",
+    "tests/integration/test_mcp.py::test_unknown_schema_and_bad_items_fail_explicitly",
+    "tests/integration/test_mcp.py::test_pagination_is_bounded_and_marked_incomplete",
+    "tests/integration/test_mcp.py::test_startup_failure_is_reported_not_raised_by_runner"
+  ],
+  "expectation": "本地 stdio MCP 初始化/发现/调用；只暴露两个工具；isError/未知结构/权限失败不转空；分页受限。"
+}

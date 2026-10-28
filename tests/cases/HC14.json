@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "HC14",
+  "title": "工具与上下文关联可回查",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_review.py::test_tool_evidence_context_links_are_reviewable"
+  ],
+  "expectation": "工具调用、证据、展示视图和 claim 可沿 ID 回查；未展示证据有 omission；失败/重试保留关联。",
+  "status": "not_run"
+}

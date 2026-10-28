@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "HC04",
+  "title": "版本失效与结果引用真实性",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_acceptance.py::test_stale_targets_and_artifact_integrity"
+  ],
+  "expectation": "源码/配置/语料/检查定义或产物变化令旧结果 stale；越界、缺失、hash 不符不能计入通过。",
+  "status": "not_run"
+}

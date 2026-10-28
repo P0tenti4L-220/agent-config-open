@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "NC23",
+  "title": "案例定义替换拒绝",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_case_binding.py::test_substituted_case_definition_does_not_count_for_ac01"
+  ],
+  "expectation": "同 ID 但节点被替换的案例定义不能作为当前签出的 AC01 证据。",
+  "status": "not_run"
+}

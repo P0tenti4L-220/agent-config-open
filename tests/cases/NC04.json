@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC04",
+  "title": "before_tool 异常时零副作用",
+  "level": "offline",
+  "pytest": [
+    "tests/test_policy_lifecycle.py::test_before_tool_exception_blocks_execution"
+  ],
+  "expectation": "before_tool 异常按 fail-closed 处理；dispatch 次数为 0，结果带 rule id 且只消耗一次尝试。",
+  "status": "not_run"
+}

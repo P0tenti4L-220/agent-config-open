@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "AC13",
+  "title": "MCP 未配置或断网",
+  "level": "offline",
+  "pytest": [
+    "tests/test_pipeline.py::test_demo_pipeline_facts_and_refs",
+    "tests/test_pipeline.py::test_mcp_configured_but_unavailable_stays_partial"
+  ],
+  "expectation": "本地分析仍输出；远端 not_run 或 error 有原因；不声称无历史；整体 partial；不算 MCP live 成功。"
+}

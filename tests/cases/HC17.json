@@ -1,0 +1,16 @@
+{
+  "schema_version": 2,
+  "id": "HC17",
+  "title": "本地实验隔离、缺失分母与可比性",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_experiments.py::test_plan_registers_every_slot",
+    "tests/test_experiments.py::test_replay_run_is_isolated_and_attempts_are_preserved",
+    "tests/test_experiments.py::test_score_keeps_missing_trials_in_the_denominator",
+    "tests/test_experiments.py::test_compare_rejects_a_different_dataset",
+    "tests/test_experiments.py::test_mode_change_and_live_optin_are_rejected"
+  ],
+  "expectation": "实验先登记 slot 再执行；每个 trial 使用独立输出根；失败/未运行保留在分母；不同数据集或模式变化拒绝硬比较。",
+  "status": "not_run"
+}

@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "NC20.routing",
+  "title": "playbook 路由自动测试",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_investigation_claims.py::test_playbooks_route_by_error_and_fall_back_to_generic"
+  ],
+  "expectation": "错误类型映射到对应 playbook，歧义时回退 generic；这只证明路由，不证明人工走查。",
+  "status": "not_run"
+}

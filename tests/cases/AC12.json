@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "AC12",
+  "title": "中断恢复与上下文过期",
+  "level": "offline",
+  "pytest": [
+    "tests/test_runner.py::test_resume_preserves_budget_and_does_not_repeat_completed_tool_calls",
+    "tests/test_runner.py::test_resume_rejects_changed_sources_unless_explicitly_accepted",
+    "tests/test_outputs_store.py::test_artifacts_are_atomic_and_parse",
+    "tests/test_runner.py::test_resume_rejects_changed_config_fingerprint"
+  ],
+  "expectation": "恢复保留累计预算且不重跑已完成调用；变化被标记；事实/假设/未执行项仍区分；无半截 JSON。"
+}

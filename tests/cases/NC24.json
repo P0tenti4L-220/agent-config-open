@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "NC24",
+  "title": "issue 读取与证据关联",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_livecheck.py::test_issue_chain_rejects_read_for_another_issue"
+  ],
+  "expectation": "读取其他 issue 或无 evidence_refs 的成功读取不能通过 live 链路校验。",
+  "status": "not_run"
+}

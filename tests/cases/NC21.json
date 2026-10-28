@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "NC21",
+  "title": "请求视图展示证明",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_request_views.py::test_claim_display_fails_when_body_never_enters_provider_request"
+  ],
+  "expectation": "证据正文未进入任何 provider 请求时，claim-display 必须失败，不能因证据已存储或已读取而通过。",
+  "status": "not_run"
+}

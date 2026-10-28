@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "HC03",
+  "title": "profile 严格完成语义",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_acceptance.py::test_profile_semantics_and_exit_codes"
+  ],
+  "expectation": "仅全部必需项 current/pass 为 pass；缺项 incomplete；fail/error 分别退出 1/4；required 不能用 not_applicable 绕过。",
+  "status": "not_run"
+}

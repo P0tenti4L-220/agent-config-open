@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "id": "AC15.quality",
+  "title": "五个冻结案例的人工诊断评分",
+  "level": "human",
+  "source": "human_review",
+  "expectation": "至少 4/5 下一步被人工判为正确；无依据事实、未执行报 pass、未授权写操作均为零；五例全部保留。",
+  "status": "not_run"
+}

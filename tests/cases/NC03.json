@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC03",
+  "title": "provider 消息配对与上下文压缩",
+  "level": "offline",
+  "pytest": [
+    "tests/test_context.py::test_protocol_compaction_keeps_complete_pairs"
+  ],
+  "expectation": "压缩历史时保留完整 user/assistant 消息对，不把半条工具消息送入 provider。",
+  "status": "not_run"
+}

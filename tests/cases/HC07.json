@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "HC07",
+  "title": "模型不能自授外部复核状态",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_review.py::test_model_cannot_self_authorize_support_review"
+  ],
+  "expectation": "模型回放自带 reviewer/status=pass 时字段被降为 not_run 并记录原因；claim-support 不因模型自报变成 pass。",
+  "status": "not_run"
+}

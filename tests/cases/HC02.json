@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "HC02",
+  "title": "自动与人工验收分离",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_harness_catalog.py::test_parent_manual_split_does_not_inherit_routing_pass"
+  ],
+  "expectation": "只运行 NC20.routing 单测不会让 NC20.manual 或父项通过；完整子项聚合保留各自证据类型。",
+  "status": "not_run"
+}

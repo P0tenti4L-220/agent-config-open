@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "AC15.live",
+  "title": "真实模型经 GitHub MCP 读取指定 issue 并用于结论",
+  "level": "live",
+  "source": "pytest",
+  "pytest": [
+    "tests/integration/test_live_smoke.py::test_live_model_and_github_smoke"
+  ],
+  "expectation": "模型真实发出工具请求；搜索与 issue 读取都成功；目标 issue 内容进入证据、被展示且在相关 claim 中引用。",
+  "status": "not_run"
+}

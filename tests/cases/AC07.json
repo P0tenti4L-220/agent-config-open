@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "AC07",
+  "title": "未执行、伪引用和过期验证",
+  "level": "offline",
+  "pytest": [
+    "tests/test_contracts.py::test_check_status_requires_evidence_of_execution",
+    "tests/test_outputs_store.py::test_validate_accepts_valid_refs_and_fails_random_ids",
+    "tests/test_outputs_store.py::test_check_status_and_old_hash_do_not_promote"
+  ],
+  "expectation": "非法状态/引用被拒绝；旧 hash 不代表当前对象通过；格式检查与复现验证分开。"
+}

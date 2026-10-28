@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "AC08",
+  "title": "循环、超时与预算",
+  "level": "offline",
+  "pytest": [
+    "tests/test_runner.py::test_duplicate_call_without_new_evidence_stops_path",
+    "tests/test_runner.py::test_read_only_tool_retries_once_and_counts_both_attempts",
+    "tests/test_runner.py::test_tool_budget_exhaustion_stops_before_more_work",
+    "tests/test_runner.py::test_budget_refuses_request_after_deadline",
+    "tests/test_runner.py::test_runner_does_not_request_model_after_deadline",
+    "tests/test_runner.py::test_missing_final_output_becomes_failed_after_one_correction"
+  ],
+  "expectation": "失败与重试计数；只读最多重试一次；重复无新证据停止；超限不再发请求；保存准确停止原因。"
+}

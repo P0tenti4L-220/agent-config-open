@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC19",
+  "title": "经验适用范围与 legacy",
+  "level": "offline",
+  "pytest": [
+    "tests/test_investigation_claims.py::test_lesson_scope_is_explicit_for_version_and_legacy"
+  ],
+  "expectation": "经验按 rule_version 标记 current/out_of_scope/legacy；v1 验证记录不自动当作当前版本证据。",
+  "status": "not_run"
+}

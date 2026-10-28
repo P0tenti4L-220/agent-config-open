@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "NC26",
+  "title": "live 测试显式启用",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_live_optin.py::test_live_test_skips_without_explicit_opt_in"
+  ],
+  "expectation": "凭据齐全但未显式启用 live 时默认跳过，不触发真实请求。",
+  "status": "not_run"
+}

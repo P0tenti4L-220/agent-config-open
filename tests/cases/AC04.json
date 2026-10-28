@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "AC04",
+  "title": "长日志和上下文预算",
+  "level": "offline",
+  "pytest": [
+    "tests/test_evidence_tools.py::test_long_log_continuation_and_limits",
+    "tests/test_context.py::test_long_evidence_is_truncated_with_visible_reason",
+    "tests/test_context.py::test_context_budget_counts_tools_and_protocol",
+    "tests/test_context.py::test_protocol_compaction_keeps_complete_pairs"
+  ],
+  "expectation": "限制读取大小与结果数量；截断有标记和索引；按范围继续读取；预算计入工具定义与协议消息。"
+}

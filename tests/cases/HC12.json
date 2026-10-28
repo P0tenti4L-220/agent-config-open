@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "HC12",
+  "title": "开发交接遇代码变化时先核对",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_handoff.py::test_development_handoff_detects_changes"
+  ],
+  "expectation": "partial/dirty 可保存且 next_action 明确；HEAD/源码/证据变化后状态不沿用；不自动执行文本命令或清空工作树。",
+  "status": "not_run"
+}

@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "id": "AC15",
+  "title": "真实模型、GitHub MCP 与人工试点（父项聚合）",
+  "level": "live",
+  "source": "aggregate",
+  "children": [
+    "AC15.live",
+    "AC15.quality"
+  ],
+  "expectation": "父项只在真实联调与五例人工评分都通过时通过；旧 AC15 结果不推断子项通过。",
+  "status": "not_run"
+}

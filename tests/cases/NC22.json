@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "NC22",
+  "title": "人工验收来源绑定",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_case_binding.py::test_pytest_record_cannot_satisfy_human_review_check"
+  ],
+  "expectation": "human_review 检查收到 pytest 来源记录时按来源伪配报 error，不能计为当前通过。",
+  "status": "not_run"
+}

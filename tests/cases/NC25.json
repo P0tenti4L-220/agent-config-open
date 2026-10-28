@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "id": "NC25",
+  "title": "live 产物导入闭环",
+  "level": "offline",
+  "source": "pytest",
+  "pytest": [
+    "tests/test_live_bundle.py::test_bundle_round_trip_and_hc09_import"
+  ],
+  "expectation": "真实运行产物可校验、导入为 HC09 run_artifact，并与同一 target/run_id 绑定。",
+  "status": "not_run"
+}

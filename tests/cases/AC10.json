@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "id": "AC10",
+  "title": "日志与 issue 中的指令注入",
+  "level": "offline",
+  "pytest": ["tests/test_context.py::test_injection_text_and_illegal_tool_requests_are_not_trusted"],
+  "expectation": "外部正文仅作不可信证据；未知工具与越界参数由运行时拒绝；不依赖模型自觉拒绝。"
+}

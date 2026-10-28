@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC08",
+  "title": "查询含密钥时不出站",
+  "level": "offline",
+  "pytest": [
+    "tests/test_policy_lifecycle.py::test_github_query_with_token_is_not_sent"
+  ],
+  "expectation": "GitHub 查询命中凭据模式时在程序层拒绝，后端调用次数为 0，本地分析继续并记录缺失。",
+  "status": "not_run"
+}

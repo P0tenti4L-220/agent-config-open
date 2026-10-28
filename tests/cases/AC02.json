@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "AC02",
+  "title": "未知结构与严格类型",
+  "level": "offline",
+  "pytest": [
+    "tests/test_contracts.py::test_unknown_schema_version_and_extra_fields_are_rejected",
+    "tests/test_contracts.py::test_counts_reject_arrays_strings_bools_and_floats",
+    "tests/test_contracts.py::test_tool_result_strict_types_and_status_shape"
+  ],
+  "expectation": "合法样例接受；未知版本和意外字段被拒绝；数组/字符串/bool/浮点不转换成整数或空列表。"
+}

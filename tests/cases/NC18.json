@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC18",
+  "title": "多目标 hash 部分不匹配",
+  "level": "offline",
+  "pytest": [
+    "tests/test_feedback_v2.py::test_v2_one_of_two_targets_mismatch_keeps_partial_hashes"
+  ],
+  "expectation": "所有目标 hash 都验证；任一不匹配即拒绝晋升，并在 outcome.json 保留部分当前 hash 供审计。",
+  "status": "not_run"
+}

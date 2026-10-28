@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "event_id": "demo-event-001",
+  "occurred_at": "2026-10-24T20:00:00+08:00",
+  "project_id": "sample-project",
+  "rule_version": "v0.1.0",
+  "goal": "读取检查记录，定位 KeyError 的来源并整理下一步验证材料",
+  "symptom": "KeyError: 'items'",
+  "error_files": [
+    "logs/failure.log"
+  ],
+  "related_files": [
+    "src/check_reader.py",
+    "data/checks.json"
+  ],
+  "attempts": [],
+  "environment": {
+    "language": "python",
+    "runtime_version": null
+  },
+  "source": {
+    "kind": "synthetic_fixture",
+    "session_id": null
+  },
+  "note": "Synthetic event. Run agent-triage demo to generate its project files."
+}

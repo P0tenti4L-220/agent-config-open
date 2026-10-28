@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "NC10",
+  "title": "已读但未展示的证据不能引用",
+  "level": "offline",
+  "pytest": [
+    "tests/test_investigation_claims.py::test_claim_display_is_separate_from_reference"
+  ],
+  "expectation": "claim 的引用必须真实出现在模型看过的有界视图；仅存在于 evidence store 不算展示。",
+  "status": "not_run"
+}

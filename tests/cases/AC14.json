@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "AC14",
+  "title": "经验反馈与问题归属",
+  "level": "offline",
+  "pytest": [
+    "tests/test_outputs_store.py::test_business_defect_gets_no_central_issue_draft_and_no_absolute_paths",
+    "tests/test_outputs_store.py::test_public_workflow_issue_draft_is_local_and_sanitized",
+    "tests/test_outputs_store.py::test_check_status_and_old_hash_do_not_promote",
+    "tests/test_outputs_store.py::test_owner_confirmed_outcome_promotes_lesson_and_resolves_run"
+  ],
+  "expectation": "业务缺陷不生成中央草稿；不完整验证不晋升；完整验证加所有者确认才晋升；产物脱敏。"
+}
