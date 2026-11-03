@@ -388,6 +388,9 @@ class Analysis(StrictModel):
     missing_evidence: list[ShortStr] = Field(default_factory=list, max_length=20)
     suggested_checks: list[SuggestedCheck] = Field(default_factory=list, max_length=20)
     duplicate_candidates: list[DuplicateCandidate] = Field(default_factory=list, max_length=20)
+    # Additive v2 field: layered issue leads keep their real repository identity
+    # and per-dimension assessment.  Absent in historical payloads.
+    related_issues: list[RelatedIssue] = Field(default_factory=list, max_length=20)
     analysis_status: AnalysisStatus
     stop_reason: StopReason
     # Explicit v1 -> v2 adapter breadcrumb.  Old payloads keep loading, but the
@@ -903,12 +906,12 @@ class BudgetLimits(StrictModel):
 
 class ContextLimits(StrictModel):
     constraints_tokens: StrictInt = Field(default=1000, ge=0, le=50_000)
-    tool_definitions_tokens: StrictInt = Field(default=1200, ge=0, le=50_000)
+    tool_definitions_tokens: StrictInt = Field(default=1600, ge=0, le=50_000)
     task_facts_tokens: StrictInt = Field(default=2000, ge=0, le=50_000)
     current_evidence_tokens: StrictInt = Field(default=4800, ge=0, le=100_000)
     history_tokens: StrictInt = Field(default=1500, ge=0, le=50_000)
     working_state_tokens: StrictInt = Field(default=1500, ge=0, le=50_000)
-    total_input_tokens: StrictInt = Field(default=12_000, ge=1000, le=500_000)
+    total_input_tokens: StrictInt = Field(default=12_400, ge=1000, le=500_000)
     max_output_tokens: StrictInt = Field(default=3000, ge=256, le=64_000)
     reserve_tokens: StrictInt = Field(default=1000, ge=0, le=64_000)
 
@@ -946,8 +949,65 @@ class MCPConfig(StrictModel):
         return self
 
 
+class ResearchLayer(StrEnum):
+    CURRENT = "current"
+    DEPENDENCIES = "dependencies"
+    PUBLIC = "public"
+
+
+class DependencyMapping(StrictModel):
+    """Trusted package -> upstream repository mapping from configuration.
+
+    Only these repositories may be searched at the dependency layer.  A log or
+    an issue cannot register a new upstream repository.
+    """
+
+    ecosystem: Literal["pypi", "npm"] = "pypi"
+    package: ShortStr
+    import_names: list[ShortStr] = Field(default_factory=list, max_length=20)
+    repo: str
+
+    @field_validator("repo")
+    @classmethod
+    def _repo_shape(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
+            raise ValueError("dependency repo must look like owner/name")
+        return value
+
+
+class IssueResearchConfig(StrictModel):
+    """Program-enforced bounds for layered issue research.
+
+    ``mode="legacy"`` keeps the historical single-repository behaviour.  The
+    layered mode is opt-in and requires ``schema_version = 2``.
+    """
+
+    mode: Literal["legacy", "layered"] = "legacy"
+    max_scope: Literal["current", "dependencies", "public"] = "current"
+    max_dependency_repos: StrictInt = Field(default=2, ge=1, le=5)
+    max_searches: StrictInt = Field(default=6, ge=1, le=20)
+    max_issue_reads: StrictInt = Field(default=4, ge=1, le=20)
+    max_remote_requests: StrictInt = Field(default=16, ge=1, le=100)
+    candidates_per_query: StrictInt = Field(default=3, ge=1, le=5)
+    dependencies: list[DependencyMapping] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def _unique_mappings(self) -> "IssueResearchConfig":
+        packages = [item.package.lower() for item in self.dependencies]
+        if len(packages) != len(set(packages)):
+            raise ValueError("issue_research.dependencies must not repeat a package")
+        repos = [item.repo.lower() for item in self.dependencies]
+        if len(repos) != len(set(repos)):
+            raise ValueError("issue_research.dependencies must not map two packages to one repo")
+        return self
+
+    @property
+    def layered(self) -> bool:
+        return self.mode == "layered"
+
+
 class Config(StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     provider: Literal["replay", "anthropic", "deepseek"] = "replay"
     model: str = "replay"
     credential_env: str = "ANTHROPIC_API_KEY"
@@ -956,6 +1016,7 @@ class Config(StrictModel):
     budgets: BudgetLimits = Field(default_factory=BudgetLimits)
     context: ContextLimits = Field(default_factory=ContextLimits)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
+    issue_research: IssueResearchConfig = Field(default_factory=IssueResearchConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -966,6 +1027,18 @@ class Config(StrictModel):
             value.setdefault("credential_env", "DEEPSEEK_API_KEY")
             value.setdefault("base_url", "https://api.deepseek.com/anthropic")
         return value
+
+    @model_validator(mode="after")
+    def _v2_for_new_semantics(self) -> "Config":
+        if self.issue_research.layered and self.schema_version != 2:
+            raise ValueError("issue_research.mode=layered requires schema_version=2")
+        if self.schema_version == 1 and self.issue_research.dependencies:
+            raise ValueError("issue_research.dependencies requires schema_version=2")
+        if self.issue_research.layered and not self.mcp.enabled:
+            raise ValueError("layered issue research requires mcp.enabled=true")
+        if self.issue_research.layered and not self.mcp.repo:
+            raise ValueError("layered issue research requires mcp.repo as the current project target")
+        return self
 
     @field_validator("base_url")
     @classmethod
@@ -983,3 +1056,195 @@ class Config(StrictModel):
         ):
             raise ValueError("base_url must be an HTTP(S) endpoint without credentials, query or fragment")
         return value.rstrip("/")
+
+
+# ---------------------------------------------------------------------------
+# Layered issue research
+# ---------------------------------------------------------------------------
+
+ASSESSMENT_STATUS = Literal["match", "mismatch", "unknown"]
+ASSESSMENT_DIMENSIONS = ("component", "symptom", "version", "environment", "trigger", "fix")
+ISSUE_REF_RE = r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$"
+RECEIPT_ID_RE = re.compile(r"^rcpt-[0-9a-f]{12}$")
+
+
+class ProfileDependency(StrictModel):
+    ecosystem: Literal["pypi", "npm"]
+    package: ShortStr
+    import_names: list[ShortStr] = Field(default_factory=list, max_length=20)
+    upstream_repo: str | None = None
+    declared: ShortStr | None = None
+    locked: ShortStr | None = None
+    observed: ShortStr | None = None
+    evidence_refs: list[EvidenceId] = Field(default_factory=list, max_length=10)
+    notes: list[ShortStr] = Field(default_factory=list, max_length=10)
+
+
+class ProjectProfile(StrictModel):
+    """What the run knows about the failing project, with explicit gaps."""
+
+    schema_version: Literal[1] = 1
+    project_repo: str | None = None
+    repo_source: Literal["config", "config_remote_match", "config_remote_mismatch", "unresolved"] = "unresolved"
+    local_remote: str | None = None
+    language: str | None = None
+    runtime_version: str | None = None
+    os_name: str | None = None
+    architecture: str | None = None
+    dependencies: list[ProfileDependency] = Field(default_factory=list, max_length=50)
+    source_hashes: dict[RelativePath, Sha256] = Field(default_factory=dict)
+    gaps: list[ShortStr] = Field(default_factory=list, max_length=20)
+
+
+class IssueIdentity(StrictModel):
+    owner: str
+    repo: str
+    number: StrictInt = Field(ge=1)
+    issue_ref: str
+    url: str
+
+    @field_validator("issue_ref")
+    @classmethod
+    def _issue_ref_shape(cls, value: str) -> str:
+        if not re.fullmatch(ISSUE_REF_RE, value):
+            raise ValueError("issue_ref must look like owner/repo#123")
+        return value
+
+
+class ReceiptIssue(StrictModel):
+    issue_ref: str
+    number: StrictInt = Field(ge=1)
+    title: ShortStr | None = None
+    state: Literal["open", "closed", "unknown"] = "unknown"
+    url: str
+    evidence_id: EvidenceId
+
+
+class SearchReceipt(StrictModel):
+    """Proof that an issue identity came back from one bounded search call."""
+
+    schema_version: Literal[1] = 1
+    receipt_id: str
+    run_id: str
+    layer: ResearchLayer
+    scope: str
+    query_sha256: Sha256
+    call_id: str
+    evidence_id: EvidenceId
+    snapshot_sha256: Sha256
+    issues: list[ReceiptIssue] = Field(default_factory=list, max_length=10)
+    captured_at: datetime
+
+    @field_validator("receipt_id")
+    @classmethod
+    def _receipt_id_shape(cls, value: str) -> str:
+        if not RECEIPT_ID_RE.fullmatch(value):
+            raise ValueError("receipt_id must look like rcpt-0123456789ab")
+        return value
+
+
+class IssueAssessment(StrictModel):
+    """Per-dimension applicability, never a single confidence score."""
+
+    schema_version: Literal[1] = 1
+    issue_ref: str
+    component: ASSESSMENT_STATUS
+    symptom: ASSESSMENT_STATUS
+    version: ASSESSMENT_STATUS
+    environment: ASSESSMENT_STATUS
+    trigger: ASSESSMENT_STATUS
+    fix: ASSESSMENT_STATUS
+    evidence_refs: list[EvidenceId] = Field(min_length=1, max_length=10)
+    note: ShortStr | None = None
+    recorded_at: datetime | None = None
+
+    @field_validator("issue_ref")
+    @classmethod
+    def _issue_ref_shape(cls, value: str) -> str:
+        if not re.fullmatch(ISSUE_REF_RE, value):
+            raise ValueError("issue_ref must look like owner/repo#123")
+        return value
+
+    @property
+    def applicable(self) -> bool:
+        # The necessary conditions are component and symptom; any explicit
+        # conflict keeps the candidate a reference, not a stopping point.
+        if self.component != "match" or self.symptom != "match":
+            return False
+        return not any(
+            getattr(self, name) == "mismatch" for name in ASSESSMENT_DIMENSIONS
+        )
+
+    @property
+    def rejected(self) -> bool:
+        return self.component == "mismatch" or self.symptom == "mismatch"
+
+
+class IssueCandidate(StrictModel):
+    issue_ref: str
+    layer: ResearchLayer
+    owner: str
+    repo: str
+    number: StrictInt = Field(ge=1)
+    title: ShortStr | None = None
+    state: Literal["open", "closed", "unknown"] = "unknown"
+    url: str
+    receipt_id: str
+    search_evidence_id: EvidenceId
+    read_evidence_id: EvidenceId | None = None
+    read_error: ShortStr | None = None
+    updated_at: datetime | None = None
+    assessment: IssueAssessment | None = None
+
+    @property
+    def read(self) -> bool:
+        return self.read_evidence_id is not None
+
+
+class LayerRecord(StrictModel):
+    layer: ResearchLayer
+    queries: list[ShortStr] = Field(default_factory=list, max_length=20)
+    searches: StrictInt = Field(default=0, ge=0)
+    reads: StrictInt = Field(default=0, ge=0)
+    errors: list[ShortStr] = Field(default_factory=list, max_length=20)
+    coverage: list[ShortStr] = Field(default_factory=list, max_length=20)
+    stop_note: ShortStr | None = None
+
+
+class IssueResearchState(StrictModel):
+    schema_version: Literal[1] = 1
+    mode: Literal["layered"] = "layered"
+    layer: ResearchLayer = ResearchLayer.CURRENT
+    scope_limit: Literal["current", "dependencies", "public"] = "current"
+    status: Literal["pending", "waiting_assessment", "done"] = "pending"
+    searches_used: StrictInt = Field(default=0, ge=0)
+    reads_used: StrictInt = Field(default=0, ge=0)
+    remote_requests_used: StrictInt = Field(default=0, ge=0)
+    pending_issue_ref: str | None = None
+    layers: list[LayerRecord] = Field(default_factory=list)
+    candidates: list[IssueCandidate] = Field(default_factory=list, max_length=50)
+    receipts: list[SearchReceipt] = Field(default_factory=list, max_length=20)
+    stop_reason: str | None = None
+    gaps: list[ShortStr] = Field(default_factory=list, max_length=20)
+    started_at: datetime
+    updated_at: datetime
+
+    @model_validator(mode="after")
+    def _receipts_and_candidates_agree(self) -> "IssueResearchState":
+        refs = [candidate.issue_ref for candidate in self.candidates]
+        if len(refs) != len(set(refs)):
+            raise ValueError("issue candidates must be unique by issue_ref")
+        for candidate in self.candidates:
+            if candidate.receipt_id not in {receipt.receipt_id for receipt in self.receipts}:
+                raise ValueError("candidate receipt must be present in the persisted receipts")
+        return self
+
+
+class RelatedIssue(StrictModel):
+    issue_ref: str
+    layer: ResearchLayer
+    title: ShortStr | None = None
+    state: Literal["open", "closed", "unknown"] = "unknown"
+    url: str
+    applicability: Literal["applicable", "reference", "rejected", "unassessed"]
+    assessment: IssueAssessment | None = None

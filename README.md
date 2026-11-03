@@ -73,6 +73,7 @@ macOS / Linux 可用 `sh scripts/run-agent.sh analyze ...`：自动使用 `.venv
 
 - [Anthropic](examples/anthropic.toml)：设置 `model` 和 `ANTHROPIC_API_KEY`。
 - [只读 GitHub MCP](examples/github-mcp.toml)：填写仓库、MCP 可执行路径与本机 Token。详见[使用说明](docs/usage.md)。
+- [分层 Issue 检索](examples/github-layered.toml)：在只读 MCP 基础上显式启用当前项目 → 依赖上游 → 公共回退，并为依赖配置可信仓库映射。
 - [事件 JSON](examples/event.json)：更精确地指定报错文件和相关文件；对应项目文件可由 `demo` 生成。
 
 ## 工作原理
@@ -87,7 +88,9 @@ flowchart LR
     F --> G[报告 / 上下文 / 交接]
 ```
 
-模型只能调用七个工具：`read_file`、`search_text`、`git_status`、`search_lessons`、`github_search_issues`、`github_read_issue`、`read_evidence`。最后一个工具只读取当前运行已经登记的快照；它不接受任意路径或 URL。项目路径、工具参数、模型请求次数、工具次数和运行时间由程序限制。恢复运行保留累计预算。
+模型只能调用八个工具：`read_file`、`search_workspace`、`get_git_context`、`search_lessons`、`github_search_issues`、`github_read_issue`、`record_issue_assessment`、`read_evidence`。`read_evidence` 只读取当前运行已经登记的快照，不接受任意路径或 URL；`record_issue_assessment` 只提交逐项适用性判断，由程序校验候选与证据后再更新检索状态。项目路径、搜索仓库、工具参数、模型请求次数、工具次数和运行时间由程序限制。恢复运行保留累计预算。
+
+开启 `issue_research.mode = "layered"`（需要 `schema_version = 2`）后，程序按“当前项目 → 配置中映射的依赖上游 → `is:public` 公共层”逐层搜索，每个候选先读取正文再要求逐项评估；搜索范围、依赖仓库和扩大层级的时机都不由模型文本决定。候选回执绑定本次运行的查询与证据快照，跨仓库 Issue 保留真实 `owner/repo#number`。找到适用线索不会自动升级为已确认根因。
 
 这是诊断助手：不自动修复业务源码、不执行任意 shell，也不发布 issue。建议的检查保留 `not_run`；模型自评不能代替外部复核。
 

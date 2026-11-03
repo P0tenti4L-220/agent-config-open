@@ -56,7 +56,7 @@ def _build(tmp_path: Path, *, limits: ContextLimits | None = None, conversation=
 def test_context_budget_counts_tools_and_protocol(tmp_path: Path) -> None:
     context, builder, evidence, store, _ = _build(tmp_path)
     packet = context.packet
-    assert packet.budget.total_used_tokens <= packet.budget.total_limit_tokens == 12_000
+    assert packet.budget.total_used_tokens <= packet.budget.total_limit_tokens == 12_400
     layers = {layer.layer: layer for layer in packet.budget.layers}
     assert layers["tool_definitions"].used_tokens > 0
     assert layers["current_evidence"].used_tokens > 0
@@ -268,12 +268,12 @@ def test_protocol_compaction_keeps_complete_pairs(tmp_path: Path) -> None:
         tmp_path,
         limits=ContextLimits(
             constraints_tokens=300,
-            tool_definitions_tokens=1300,
+            tool_definitions_tokens=1600,
             task_facts_tokens=300,
             current_evidence_tokens=300,
             history_tokens=100,
             working_state_tokens=200,
-            total_input_tokens=2500,
+            total_input_tokens=3400,
         ),
         conversation=conversation,
     )

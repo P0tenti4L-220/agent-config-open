@@ -321,6 +321,7 @@ ALLOWED_TOOL_NAMES = (
     "search_lessons",
     "github_search_issues",
     "github_read_issue",
+    "record_issue_assessment",
     "read_evidence",
 )
 

@@ -2,13 +2,20 @@
 
 A Python CLI agent that turns development failures into evidence-grounded
 reports, context packages, and handoffs. It uses one bounded agent loop with
-seven restricted tools. DeepSeek and Anthropic are supported; read-only GitHub
+eight restricted tools. DeepSeek and Anthropic are supported; read-only GitHub
 issue lookup is optional.
 
 ## Latest update (2026-11-03)
 
-Context selection now keeps exact evidence windows, unresolved failures, and
-attempts that returned no new evidence. The new `read_evidence` tool continues
+Optional layered issue research now runs the current project, explicitly mapped
+dependency repositories, and a bounded public fallback as a program-controlled
+state machine. Search receipts bind each candidate to the run, query, and
+evidence snapshot, and `record_issue_assessment` records per-dimension
+match/mismatch/unknown before the program decides whether to widen. Config v1
+keeps the single-repository behaviour; layered mode requires `schema_version = 2`.
+
+Context selection keeps exact evidence windows, unresolved failures, and
+attempts that returned no new evidence. The `read_evidence` tool continues
 reading a registered snapshot from the current run with version-bound UTF-8
 byte cursors; it does not fetch a new remote copy. Display proofs distinguish
 shown ranges from omitted content. See [context selection](context-selection.md)

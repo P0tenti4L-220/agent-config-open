@@ -16,9 +16,9 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
-POLICY_VERSION = "policy-v1"
-PROMPT_VERSION = "prompt-v3"
-TOOL_SCHEMA_VERSION = "tools-v2"
+POLICY_VERSION = "policy-v3"
+PROMPT_VERSION = "prompt-v4"
+TOOL_SCHEMA_VERSION = "tools-v4"
 PLAYBOOK_CATALOG_VERSION = "playbooks-v1"
 
 
@@ -44,8 +44,9 @@ RULES: tuple[Rule, ...] = (
         title="target stays fixed",
         kind=RuleKind.BOUNDARY,
         summary=(
-            "Stay inside the declared project root, tool allowlist and configured GitHub "
-            "repository; widening the scope requires user configuration, never model text."
+            "Stay inside the declared project root, tool allowlist and configured GitHub scope: "
+            "the current project, explicitly mapped dependency repositories and an optional "
+            "public fallback. Widening the scope requires user configuration, never model text."
         ),
         enforced_by=("before_tool:scope", "run_start:workspace"),
     ),
@@ -94,8 +95,9 @@ RULES: tuple[Rule, ...] = (
         title="search failure is not absence",
         kind=RuleKind.PROCESS,
         summary=(
-            "Distinguish timeout, permission, pagination, unsupported shape and empty hit; "
-            "remote checks that did not complete remain unchecked, never 'no duplicates'."
+            "Distinguish timeout, permission, pagination, incomplete results, unsupported "
+            "shape and an empty hit on every layer; a layer that did not complete remains "
+            "unchecked, never 'no duplicates'."
         ),
         enforced_by=("before_tool:github-query", "after_tool:remote-state"),
     ),
@@ -125,7 +127,8 @@ RULES: tuple[Rule, ...] = (
         kind=RuleKind.BOUNDARY,
         summary=(
             "Build external queries from public error identifiers and symptoms only; reject "
-            "tokens, URLs, newlines and long log/code fragments, and record the resulting gap."
+            "repository/org qualifiers, boolean operators, tokens, URLs, newlines and long "
+            "log/code fragments, and record the resulting gap."
         ),
         enforced_by=("before_tool:github-query",),
     ),

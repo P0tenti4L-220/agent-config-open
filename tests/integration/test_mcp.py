@@ -115,3 +115,24 @@ def test_startup_failure_is_reported_not_raised_by_runner() -> None:
     with pytest.raises(ToolFailure) as info:
         backend.search_issues("x", 1)
     assert info.value.code == "mcp_command_not_found"
+
+def test_scoped_search_uses_program_scope_and_public_requires_identity() -> None:
+    from agent_triage.contracts import ResearchLayer
+    from agent_triage.github_scope import SearchScope
+
+    backend = _backend("normal")
+    try:
+        scoped = backend.search_issues(
+            "KeyError",
+            2,
+            scope=SearchScope(layer=ResearchLayer.CURRENT, repo="example/repo"),
+        )
+        assert scoped.query.endswith("repo:example/repo is:issue")
+        assert scoped.issues[0]["issue_ref"] == "example/repo#1"
+        with pytest.raises(ToolFailure) as info:
+            backend.search_issues(
+                "KeyError", 2, scope=SearchScope(layer=ResearchLayer.PUBLIC, public=True)
+            )
+        assert info.value.code == "missing_issue_identity"
+    finally:
+        backend.close()

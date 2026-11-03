@@ -24,6 +24,7 @@ from .contracts import (
     EvidenceKind,
     EvidenceSummary,
     InvestigationState,
+    IssueResearchState,
     Lesson,
     LessonStatus,
     LessonSummary,
@@ -54,6 +55,7 @@ ARTIFACT_NAMES = {
     "lifecycle.json",
     "display.json",
     "investigation.json",
+    "issue-research.json",
     "versions.json",
     "promotion-check.json",
     "evidence/index.json",
@@ -342,6 +344,7 @@ class Checkpoint(StrictModel):
     playbook_id: str | None = None
     playbook_version: str | None = None
     playbook_hash: str | None = None
+    issue_research: IssueResearchState | None = None
     updated_at: datetime
 
 

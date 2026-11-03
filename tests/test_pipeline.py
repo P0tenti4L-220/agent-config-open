@@ -261,7 +261,7 @@ def test_cli_policy_manifest_is_code_derived(capsys) -> None:
     assert cli.main(["policy"]) == 0
     payload = json.loads(capsys.readouterr().out)
     manifest = payload["manifest"]
-    assert manifest["policy_version"] == "policy-v1"
+    assert manifest["policy_version"] == "policy-v3"
     assert len(manifest["policy_hash"]) == 64
     assert len(manifest["prompt_hash"]) == 64
     assert [rule["rule_id"] for rule in payload["rules"]] == [f"R0{index}" for index in range(1, 10)]

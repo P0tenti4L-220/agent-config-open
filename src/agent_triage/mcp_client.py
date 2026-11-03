@@ -22,8 +22,9 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import CallToolResult
 
-from .contracts import MCPConfig
+from .contracts import MCPConfig, ResearchLayer
 from .errors import ToolFailure
+from .github_scope import SearchScope, parse_issue_identity
 from .tools import IssueReadOutcome, IssueSearchOutcome
 
 ALLOWED_TOOLS = ("search_issues", "issue_read")
@@ -145,14 +146,25 @@ class GitHubMCPBackend:
     def issues_checked(self) -> bool:
         return self._issues_checked
 
-    def search_issues(self, query: str, limit: int) -> IssueSearchOutcome:
+    def search_issues(
+        self,
+        query: str,
+        limit: int,
+        *,
+        scope: SearchScope | None = None,
+    ) -> IssueSearchOutcome:
         self._require_session("search_issues")
-        scope = f"repo:{self.config.repo}"
-        # The wrapper owns the repository qualifier; user text cannot widen it.
+        if scope is None:
+            if not self.config.repo:
+                raise ToolFailure("out_of_scope_issue", "no configured repository is available for this search")
+            scope = SearchScope(layer=ResearchLayer.CURRENT, repo=self.config.repo)
+        # The wrapper owns the scope qualifier; user text cannot widen it.
         clean_query = " ".join(
-            token for token in query.split() if not token.lower().startswith(("repo:", "org:", "user:"))
+            token
+            for token in query.split()
+            if not token.lower().startswith(("repo:", "org:", "user:", "is:"))
         )
-        full_query = f"{clean_query} {scope} is:issue".strip()
+        full_query = f"{clean_query} {scope.qualifier} is:issue".strip()
         arguments: dict[str, Any] = {"query": full_query}
         properties = self._schemas["search_issues"].get("properties", {})
         if "page" in properties:
@@ -170,7 +182,7 @@ class GitHubMCPBackend:
         items, total = _extract_items(payload)
         issues: list[dict[str, Any]] = []
         for item in items[:limit]:
-            normalized = _normalize_issue(item, self.config.repo or "")
+            normalized = _normalize_scoped_issue(item, expected_repo=scope.repo)
             issues.append(normalized)
             self._seen_issues.add(normalized["issue_ref"])
         self._issues_checked = True
@@ -179,19 +191,23 @@ class GitHubMCPBackend:
             issues=issues,
             total_count=total,
             complete=complete,
-            query_scope=scope,
+            query_scope=scope.label,
+            query=full_query,
+            layer=scope.layer.value,
+            incomplete=None,
         )
 
-    def read_issue(self, issue_ref: str) -> IssueReadOutcome:
+    def read_issue(self, issue_ref: str, *, allow_any_repo: bool = False) -> IssueReadOutcome:
         self._require_session("issue_read")
         owner, repo, number = _parse_issue_ref(issue_ref)
-        if f"{owner}/{repo}" != (self.config.repo or ""):
-            raise ToolFailure("out_of_scope_issue", "issue is outside the configured repository")
-        if not self._issues_checked or issue_ref not in self._seen_issues:
-            raise ToolFailure(
-                "out_of_scope_issue",
-                "issue_ref was not returned by github_search_issues in this run",
-            )
+        if not allow_any_repo:
+            if f"{owner}/{repo}" != (self.config.repo or ""):
+                raise ToolFailure("out_of_scope_issue", "issue is outside the configured repository")
+            if not self._issues_checked or issue_ref not in self._seen_issues:
+                raise ToolFailure(
+                    "out_of_scope_issue",
+                    "issue_ref was not returned by github_search_issues in this run",
+                )
         arguments: dict[str, Any] = {}
         properties = self._schemas["issue_read"].get("properties", {})
         for key, value in (
@@ -206,7 +222,13 @@ class GitHubMCPBackend:
             raise ToolFailure("unsupported_tool_schema", "issue_read has no issue_number parameter")
         payload = self._call("issue_read", arguments)
         issue = _extract_issue(payload)
-        normalized = _normalize_issue(issue, self.config.repo or "")
+        # The response must confirm the requested repository and number; the
+        # configuration repository is never stamped onto a foreign issue.
+        normalized = _normalize_scoped_issue(
+            issue, expected_repo=f"{owner}/{repo}", expected_number=number
+        )
+        if allow_any_repo and normalized["issue_ref"] != issue_ref:
+            raise ToolFailure("ambiguous_issue_identity", "issue_read returned a different issue than requested")
         url = normalized["html_url"]
         comments: list[dict[str, Any]] = []
         comments_error: str | None = None
@@ -305,25 +327,33 @@ def _extract_items(payload: Any) -> tuple[list[dict[str, Any]], int | None]:
     return items, total
 
 
-def _normalize_issue(item: dict[str, Any], repo: str) -> dict[str, Any]:
-    number = item.get("number")
-    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
-        raise ToolFailure("unsupported_result", "issue number is missing or not a positive integer")
+def _normalize_scoped_issue(
+    item: dict[str, Any],
+    *,
+    expected_repo: str | None,
+    expected_number: int | None = None,
+) -> dict[str, Any]:
+    owner, repo, number, html_url = parse_issue_identity(
+        item,
+        expected_repo=expected_repo,
+        allow_expected_fallback=expected_repo is not None,
+    )
+    if expected_number is not None and number != expected_number:
+        raise ToolFailure("ambiguous_issue_identity", "issue_read returned a different issue number")
     title = item.get("title")
     if not isinstance(title, str) or not title.strip():
         raise ToolFailure("unsupported_result", "issue title is missing")
-    url = item.get("html_url") or item.get("url")
-    if not isinstance(url, str) or not url.startswith(("https://", "http://")):
-        raise ToolFailure("unsupported_result", "issue URL is missing or unsupported")
     state = item.get("state") if isinstance(item.get("state"), str) else "unknown"
     updated = item.get("updated_at") if isinstance(item.get("updated_at"), str) else None
     body = item.get("body") if isinstance(item.get("body"), str) else None
     return {
-        "issue_ref": f"{repo}#{number}",
+        "issue_ref": f"{owner}/{repo}#{number}",
+        "owner": owner,
+        "repo": repo,
         "number": number,
         "title": title[:500],
         "state": state,
-        "html_url": url,
+        "html_url": html_url,
         "updated_at": updated,
         "body": body[:10000] if body else None,
     }
