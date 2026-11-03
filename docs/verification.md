@@ -2,6 +2,24 @@
 
 本文件只记录公开版自己的运行结果，不引用私人仓库的历史数字。
 
+## 2026-11-03：分层 Issue 检索
+
+环境：macOS、Python 3.11.9，公开副本独立 `.venv`。本轮把设计稿落为代码：`project_profile.py`、`github_scope.py`、`issue_research.py`、Config v2 的 `issue_research`、`record_issue_assessment` 工具、checkpoint 中的检索状态，以及 Runner 的分层调度。
+
+| 实际执行 | 退出码 | 观察到的结果 |
+|---|---|---|
+| `python -m pytest -q` | 0 | 247 passed、1 skipped（live 未启用）；含新增的 profile、scope、回执、适用性、分层 Runner 与假 MCP 用例 |
+| `python3 -c "tomllib.loads(...)"`（`examples/github-layered.toml`） | 0 | TOML 可解析；`load_config` 得到 `schema_version=2`、`mode=layered`、`max_scope=public`、1 条依赖映射 |
+| `agent-triage demo --output local/issue-research-demo` | 0 | 生成 report、context、handoff；仍为合成 replay，无真实模型或 MCP |
+| `agent-triage doctor --profile offline` | 0 | `ready`；网络与真实模型调用为 `not_run` |
+| `agent-triage eval --cases tests/cases` | 0 | 62 项：54 pass、0 fail、0 error、8 not_run |
+| `agent-triage accept --profile offline`（上一步产物） | 0 | 证据完整，离线契约检查通过 |
+| `python3 scripts/check-public.py` | 0 | 检查 161 个索引内文本文件，无配置模式命中；人工复核仍需执行 |
+
+版本：`policy-v2` / `prompt-v4` / `tools-v3`，包版本 `0.3.0`。`Config v1` 未设置 `issue_research` 时仍是单仓库 legacy 行为；layered 模式要求 `schema_version = 2`，旧配置和旧 checkpoint 不会自动获得新语义。
+
+本轮**未执行**：真实模型 + 真实 GitHub MCP 的分层联调（查询实际范围 → 回执 → 正文快照 → 后续模型展示 → 评估引用 → 最终报告）、跨 run / 改配置后的回执拒绝的真实远端复现、人工诊断质量评审。离线假 MCP 用例只证明程序边界和状态机，不证明真实 GitHub 返回结构、权限或公共层命中质量。适用线索不等于已确认根因；缺少复现时报告仍保留验证缺口。
+
 ## 2026-11-03：上下文与快照续读同步
 
 环境：macOS、Python 3.11.9。公开副本使用独立虚拟环境和锁定依赖；没有复制本机配置、凭据或真实运行数据。

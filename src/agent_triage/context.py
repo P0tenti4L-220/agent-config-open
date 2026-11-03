@@ -121,6 +121,7 @@ class ContextBuilder:
         tool_specs: list[ToolSpec],
         investigation: InvestigationState | None = None,
         playbook: Playbook | None = None,
+        research: dict[str, Any] | None = None,
     ) -> ModelContext:
         selections: list[SelectionRecord] = []
         displayed: list[DisplayedEvidence] = []
@@ -187,6 +188,7 @@ class ContextBuilder:
         base_task = self._task_text(event, evidence, budget_state)
         blocks = [
             ("investigation", self._investigation_text(investigation), 1400),
+            ("research", self._research_text(research), 1200),
             ("task", base_task, 2600),
             ("policy", policy_prompt_text(), 1400),
             ("playbook", render_playbook(playbook, max_chars=2200) if playbook else "", 2200),
@@ -215,6 +217,7 @@ class ContextBuilder:
                               SelectionDecision.TRUNCATED if rendered else SelectionDecision.OMITTED),
                     reason={
                         "investigation": "active question and necessary material",
+                        "research": "current issue-research layer, candidates and gaps",
                         "task": "goal, symptom, paths and confirmed observations",
                         "policy": "stable policy summary with rule ids",
                         "playbook": "the single routed investigation playbook",
@@ -420,6 +423,38 @@ class ContextBuilder:
                 parts.append(prefix + chunk)
                 fitted[name] = chunk
         return "\n\n".join(parts), truncated, fitted
+
+    def _research_text(self, research: dict[str, Any] | None) -> str:
+        if not research:
+            return ""
+        candidates = research.get("candidates") or []
+        lines = [
+            "ISSUE RESEARCH STATE",
+            f"layer: {research.get('layer')} (scope limit {research.get('scope_limit')})",
+            f"status: {research.get('status')}",
+            f"searches: {research.get('searches_used')}/{research.get('searches_limit')}; "
+            f"reads: {research.get('reads_used')}/{research.get('reads_limit')}; "
+            f"remote requests: {research.get('remote_requests_used')}/{research.get('remote_requests_limit')}",
+            f"stop_reason: {research.get('stop_reason')}",
+        ]
+        if research.get("gaps"):
+            lines.append("gaps:")
+            lines.extend(f"- {item}" for item in research["gaps"][:8])
+        if candidates:
+            lines.append("candidates:")
+            for candidate in candidates[:8]:
+                lines.append(
+                    f"- {candidate.get('issue_ref')} layer={candidate.get('layer')} "
+                    f"read={candidate.get('read')} applicable={candidate.get('applicable')} "
+                    f"rejected={candidate.get('rejected')} title={candidate.get('title')}"
+                )
+            lines.append(
+                "Assess read candidates with record_issue_assessment using evidence ids the model "
+                "has received; the program decides whether to widen the search."
+            )
+        else:
+            lines.append("candidates: none located yet")
+        return "\n".join(lines)
 
     def _investigation_text(self, investigation: InvestigationState | None) -> str:
         if investigation is None:

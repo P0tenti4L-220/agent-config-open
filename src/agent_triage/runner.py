@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from pydantic import ValidationError
@@ -19,6 +20,7 @@ from .config import Config
 from .context import PROMPT_MANIFEST, ContextBuilder
 from .contracts import (
     Analysis,
+    IssueAssessment,
     AnalysisStatus,
     AttemptLedgerEntry,
     Attribution,
@@ -34,10 +36,13 @@ from .contracts import (
     InvestigationState,
     OmissionImpact,
     StopReason,
+    ToolResult,
     ToolStatus,
     TraceKind,
     TraceRecord,
 )
+from .issue_research import IssueResearchController
+from .project_profile import build_project_profile
 from .lifecycle import Decision, LifecycleEngine, LifecycleEvent, build_default_engine
 from .playbooks import Playbook, catalog_manifest, get_playbook, playbook_hash, route_playbook
 from .policy import POLICY_VERSION, version_manifest
@@ -123,6 +128,23 @@ class Runner:
         self.lessons = lesson_store
         self.workspace = workspace
         self.github = github
+        self.profile = None
+        self.research: IssueResearchController | None = None
+        if config.issue_research.layered:
+            self.profile = build_project_profile(
+                workspace=workspace,
+                config=config.issue_research,
+                event=event,
+                project_repo=config.mcp.repo,
+            )
+            if github is not None and getattr(github, "available", False):
+                self.research = IssueResearchController(
+                    config=config.issue_research,
+                    profile=self.profile,
+                    event=event,
+                    run_id=store.run_id,
+                    state=checkpoint.issue_research if checkpoint is not None else None,
+                )
         self.clock = clock
         self.interrupt_after_rounds = interrupt_after_rounds
         self.accept_changed_sources = accept_changed_sources
@@ -174,6 +196,8 @@ class Runner:
             policy=self.hooks,
             evidence_lookup=self._evidence_exists,
             evidence_store=self.evidence,
+            research=self.research,
+            displayed_lookup=self._is_displayed,
         )
         if checkpoint is not None:
             self._verify_resume(checkpoint)
@@ -232,6 +256,9 @@ class Runner:
                 stop_reason = StopReason.BUDGET_EXHAUSTED
                 self.notes.append(f"stopped before a model request: {reason}")
                 break
+            if self.research is not None:
+                self.research.note_model_round()
+            self._advance_research()
             is_final_turn = self.budget.model_requests_remaining() == 1
             lessons = self.lessons.search(
                 f"{self.event.symptom} {self.event.goal}", 3, rule_version=self.event.rule_version
@@ -249,6 +276,7 @@ class Runner:
                 tool_specs=specs,
                 investigation=self.investigation,
                 playbook=self.playbook,
+                research=self.research.summary() if self.research is not None else None,
             )
             self.store.write_json("context.json", context.packet.model_dump(mode="json"))
             self._record_context(context)
@@ -413,6 +441,25 @@ class Runner:
                     )
                     after = set(self.evidence.ids())
                     new_evidence = after - before
+                    if (
+                        self.research is not None
+                        and call.name == "record_issue_assessment"
+                        and result.status == ToolStatus.OK
+                        and isinstance(result.data, dict)
+                        and isinstance(result.data.get("assessment"), dict)
+                    ):
+                        try:
+                            self.research.record_assessment(
+                                IssueAssessment.model_validate(result.data["assessment"])
+                            )
+                        except (ValidationError, ValueError) as exc:
+                            result = ToolResult(
+                                status=ToolStatus.ERROR,
+                                error_code="assessment_rejected",
+                                data={"message": str(exc)[:500]},
+                                retryable=False,
+                                duration_ms=result.duration_ms,
+                            )
                     self._record_tool_attempt(call, result, new_evidence)
                     if isinstance(result.data, dict) and "policy_warning" in result.data:
                         warning = result.data["policy_warning"]
@@ -462,6 +509,8 @@ class Runner:
                 continue
 
             if isinstance(response, FinalResponse):
+                if self.research is not None and not self.research.finished:
+                    self.research.finalize("model_finalized_before_research_complete")
                 analysis = self._apply_remote_constraint(response.analysis)
                 problems = self._candidate_problems(analysis, context.packet)
                 gate = self.hooks.evaluate(
@@ -539,6 +588,7 @@ class Runner:
 
         if analysis is None:
             analysis = self._fallback_analysis(stop_reason or StopReason.INVALID_OUTPUT)
+        analysis = self._apply_research_constraints(analysis)
         analysis = self._apply_remote_constraint(analysis)
         analysis = self._enrich_duplicate_candidates(analysis)
         if invalid_detail:
@@ -559,6 +609,9 @@ class Runner:
             )
         )
         return problems
+
+    def _is_displayed(self, evidence_id: str) -> bool:
+        return any(item.evidence_id == evidence_id for item in self.displayed)
 
     def _evidence_exists(self, evidence_id: str) -> bool:
         try:
@@ -686,6 +739,81 @@ class Runner:
             "next_action_reason": "handoff is ready; the next executor runs the listed checks",
         }
         return InvestigationState.model_validate(payload)
+
+    def _advance_research(self) -> None:
+        """Execute program-planned searches/reads before the next model request."""
+
+        if self.research is None:
+            return
+        for _ in range(8):
+            action = self.research.next_action()
+            if action is None:
+                return
+            tool_name = "github_search_issues" if action.kind == "search" else "github_read_issue"
+            arguments = action.arguments()
+            before = set(self.evidence.ids())
+            result = self.executor.execute(
+                tool_name,
+                arguments,
+                call_id=action.call_id,
+                turn=self.turn,
+                execution_context=action,
+            )
+            new_evidence = set(self.evidence.ids()) - before
+            self._record_tool_attempt(
+                SimpleNamespace(name=tool_name, arguments=arguments, call_id=action.call_id),
+                result,
+                new_evidence,
+            )
+            if result.status == ToolStatus.ERROR:
+                message = ""
+                if isinstance(result.data, dict):
+                    message = str(result.data.get("message") or "")
+                self.research.action_failed(action, result.error_code or "error", message)
+                if result.error_code in {"tool_attempt_limit", "total_time_exhausted", "research_remote_limit"}:
+                    return
+            if self.budget.tool_attempts_remaining() <= 0 or self.budget.remaining_seconds() <= 0:
+                return
+
+    def _apply_research_constraints(self, analysis: Analysis) -> Analysis:
+        if self.research is None:
+            return analysis
+        state = self.research.state
+        payload = analysis.model_dump(mode="json")
+        payload["related_issues"] = self.research.related_issues()
+        missing = list(analysis.missing_evidence)
+        additions: list[str] = [
+            gap for gap in state.gaps if gap.startswith("applicability_unknowns:")
+        ]
+        if state.stop_reason not in (None, "applicable_candidate"):
+            additions.append(
+                f"GitHub issue research stopped at layer {state.layer.value}: {state.stop_reason}"
+            )
+            additions.extend(
+                gap for gap in state.gaps[:6] if not gap.startswith("dependency_repo_mapping_missing:")
+            )
+            for candidate in state.candidates:
+                if candidate.read and candidate.assessment is None:
+                    additions.append(
+                        f"issue candidate read but not assessed: {candidate.issue_ref}"
+                    )
+        for text in additions:
+            text = text[:500]
+            if text not in missing:
+                missing.append(text)
+        if missing != analysis.missing_evidence:
+            payload["missing_evidence"] = missing[:20]
+            if payload["analysis_status"] == AnalysisStatus.COMPLETE.value:
+                payload["analysis_status"] = AnalysisStatus.PARTIAL.value
+                payload["stop_reason"] = StopReason.INSUFFICIENT_EVIDENCE.value
+            try:
+                return Analysis.model_validate(payload)
+            except ValidationError:
+                return analysis
+        try:
+            return Analysis.model_validate(payload)
+        except ValidationError:
+            return analysis
 
     def _apply_omission_impacts(self, analysis: Analysis) -> Analysis:
         if analysis.analysis_status == AnalysisStatus.FAILED or not self.investigation.omissions:
@@ -828,6 +956,8 @@ class Runner:
         self.store.write_json("lifecycle.json", self.hooks.dump())
         self._write_display()
         self.store.write_json("investigation.json", self.investigation.model_dump(mode="json"))
+        if self.research is not None:
+            self.store.write_json("issue-research.json", self._research_artifact())
         analysis_path = self.store.write_json("analysis.json", analysis.model_dump(mode="json"))
         analysis_sha = hash_file(analysis_path)
         packet = self._final_packet(analysis)
@@ -1136,6 +1266,7 @@ class Runner:
             tool_specs=tool_specs(),
             investigation=self.investigation,
             playbook=self.playbook,
+            research=self.research.summary() if self.research is not None else None,
         )
         payload = context.packet.model_dump(mode="json")
         payload["facts"] = [fact.model_dump(mode="json") for fact in analysis.facts]
@@ -1177,10 +1308,20 @@ class Runner:
             playbook_id=self.playbook.playbook_id,
             playbook_version=self.playbook.version,
             playbook_hash=playbook_hash(self.playbook),
+            issue_research=self.research.snapshot() if self.research is not None else None,
             updated_at=utcnow(),
         )
         self.store.save_checkpoint(checkpoint)
         self.store.write_json("investigation.json", self.investigation.model_dump(mode="json"))
+        if self.research is not None:
+            self.store.write_json("issue-research.json", self._research_artifact())
+
+    def _research_artifact(self) -> dict[str, Any]:
+        assert self.research is not None
+        payload = self.research.snapshot().model_dump(mode="json")
+        if self.profile is not None:
+            payload["project_profile"] = self.profile.model_dump(mode="json")
+        return payload
 
     def _verify_resume(self, checkpoint: Checkpoint) -> None:
         if checkpoint.config_fingerprint != self.store.meta.config_fingerprint:
@@ -1290,7 +1431,7 @@ class Runner:
         ]
         if self.request_views.directory.is_dir():
             names.append("request-views")
-        for optional in ("issue-draft.md", "lesson-candidate.json", "checkpoint.json"):
+        for optional in ("issue-draft.md", "lesson-candidate.json", "checkpoint.json", "issue-research.json"):
             if self.store.exists(optional):
                 names.append(optional)
         return names

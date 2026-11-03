@@ -169,6 +169,21 @@ def render_report(
             )
     else:
         lines.append("- 本地指纹和本次查询范围内没有发现候选；这不等于全局不存在重复问题。")
+    if analysis.related_issues:
+        lines.extend(["", "## 分层 Issue 检索", ""])
+        for item in analysis.related_issues:
+            assessment = ""
+            if item.assessment is not None:
+                assessment = (
+                    f"；component={item.assessment.component}, symptom={item.assessment.symptom}, "
+                    f"version={item.assessment.version}, environment={item.assessment.environment}, "
+                    f"trigger={item.assessment.trigger}, fix={item.assessment.fix}"
+                )
+            lines.append(
+                f"- `{item.layer.value}` {_safe_text(item.issue_ref)}：{_safe_text(item.title or '未命名')}；"
+                f"适用性：{item.applicability}{assessment}；{_safe_text(item.url)}"
+            )
+        lines.append("- 适用性由逐项 match/mismatch/unknown 记录；适用线索不等于根因已确认。")
     lines.extend(["", "## 证据支持性（与结构检查分开）", ""])
     if review_view is not None and review_view.get("overall") in {"pass", "fail"}:
         support_status = review_view["overall"]
@@ -402,6 +417,10 @@ def render_issue_draft(*, event: Event, analysis: Analysis, evidence: list[Evide
         )
     if not analysis.duplicate_candidates:
         lines.append("- 本次本地指纹与允许的远端查询范围内无候选；查询失败或截断时不能据此断言全局无重复。")
+    for item in analysis.related_issues:
+        lines.append(
+            f"- 分层线索 `{item.layer.value}` {_safe_text(item.issue_ref)}：适用性 {item.applicability}"
+        )
     lines.extend(["", "## 发布前检查", ""])
     lines.extend(
         [

@@ -176,4 +176,4 @@ def test_many_pages_from_one_source_do_not_starve_the_earlier_relevant_page(tmp_
     context = _context(store, evidence, budget, event, limit=400, investigation=investigation)
     assert any(w.evidence_id == important.evidence_id and "CriticalConflict" in w.text
                for w in context.packet.evidence_windows)
-    assert context.packet.budget.total_used_tokens <= 12000
+    assert context.packet.budget.total_used_tokens <= 12400

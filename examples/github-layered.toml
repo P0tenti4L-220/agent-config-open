@@ -1,0 +1,33 @@
+# Optional layered issue research: copy to local/config.toml and replace placeholders.
+# Requires schema_version = 2. Config v1 keeps the single-repository behaviour.
+provider = "deepseek"
+model = "deepseek-flash"
+credential_env = "DEEPSEEK_API_KEY"
+
+schema_version = 2
+
+[mcp]
+enabled = true
+command = "github-mcp-server"
+args = ["stdio", "--read-only", "--tools", "search_issues,issue_read"]
+repo = "YOUR_OWNER/YOUR_REPO"
+token_env = "GITHUB_PERSONAL_ACCESS_TOKEN"
+
+[issue_research]
+# legacy (default) keeps only mcp.repo; layered enables the state machine.
+mode = "layered"
+# Hard permission ceiling, not a required path: stop as soon as a candidate matches.
+max_scope = "public"          # current | dependencies | public
+max_dependency_repos = 2
+max_searches = 6
+max_issue_reads = 4
+max_remote_requests = 16
+candidates_per_query = 3
+
+# Trusted package -> upstream repository mapping. Only these repositories may be
+# searched at the dependency layer; logs and issues cannot register new ones.
+[[issue_research.dependencies]]
+ecosystem = "pypi"
+package = "example-client"
+import_names = ["example_client"]
+repo = "example/client-python"

@@ -17,7 +17,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from pydantic import Field, ValidationError, field_validator
 
@@ -26,6 +26,8 @@ from .contracts import (
     Evidence,
     EvidenceId,
     EvidenceKind,
+    IssueAssessment,
+    IssueCandidate,
     LessonSummary,
     LineNumber,
     NonEmptyStr,
@@ -39,6 +41,7 @@ from .contracts import (
     TraceKind,
     TraceRecord,
 )
+from .github_scope import ScopeViolation, SearchScope, compile_query
 from .errors import InputError, StoreError, ToolFailure
 from .ingest import MAX_INPUT_BYTES
 from .lifecycle import Decision, LifecycleEvent
@@ -116,6 +119,21 @@ class GithubReadIssueArgs(StrictModel):
     issue_ref: ShortStr = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$")
 
 
+ASSESSMENT_VALUE = Literal["match", "mismatch", "unknown"]
+
+
+class RecordIssueAssessmentArgs(StrictModel):
+    issue_ref: ShortStr = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$")
+    component: ASSESSMENT_VALUE
+    symptom: ASSESSMENT_VALUE
+    version: ASSESSMENT_VALUE
+    environment: ASSESSMENT_VALUE
+    trigger: ASSESSMENT_VALUE
+    fix: ASSESSMENT_VALUE
+    evidence_refs: list[EvidenceId] = Field(min_length=1, max_length=6)
+    note: ShortStr | None = None
+
+
 class ReadEvidenceArgs(StrictModel):
     evidence_id: EvidenceId
     cursor: str | None = Field(default=None, min_length=1, max_length=1500)
@@ -145,13 +163,20 @@ TOOL_DEFINITIONS: dict[str, tuple[type[StrictModel], str]] = {
     ),
     "github_search_issues": (
         GithubSearchIssuesArgs,
-        "Search issues in the configured GitHub repository only. Returns candidate summaries; "
-        "an empty list means the query completed with no matches.",
+        "Search issues in the program-controlled scope (configured repository by default; mapped "
+        "dependency repositories or a public fallback only when layered research is enabled). "
+        "Returns candidate summaries; an empty list means the query completed with no matches.",
     ),
     "github_read_issue": (
         GithubReadIssueArgs,
-        "Read one issue and bounded comments. issue_ref must come from github_search_issues in "
-        "this run and belong to the configured repository.",
+        "Read one issue and bounded comments. issue_ref must come from a persisted search "
+        "receipt in this run and belong to an authorized search scope.",
+    ),
+    "record_issue_assessment": (
+        RecordIssueAssessmentArgs,
+        "Record a per-dimension applicability assessment for one issue candidate located and "
+        "read in this run. Each dimension is match/mismatch/unknown with local and remote evidence ids; "
+        "this never confirms a root cause.",
     ),
     "read_evidence": (
         ReadEvidenceArgs,
@@ -356,6 +381,9 @@ class IssueSearchOutcome:
     total_count: int | None
     complete: bool
     query_scope: str
+    query: str = ""
+    layer: str = "current"
+    incomplete: bool | None = None
 
 
 @dataclass
@@ -365,28 +393,33 @@ class IssueReadOutcome:
     url: str
     updated_at: str | None
     comments_error: str | None = None
+    comments_complete: bool | None = None
 
 
 class GithubBackend(Protocol):
     available: bool
     unavailable_reason: str | None
 
-    def search_issues(self, query: str, limit: int) -> IssueSearchOutcome: ...
+    def search_issues(
+        self, query: str, limit: int, *, scope: SearchScope | None = None
+    ) -> IssueSearchOutcome: ...
 
-    def read_issue(self, issue_ref: str) -> IssueReadOutcome: ...
+    def read_issue(self, issue_ref: str, *, allow_any_repo: bool = False) -> IssueReadOutcome: ...
 
 
 class DisabledGithubBackend:
     available = False
     unavailable_reason = "mcp_not_configured"
 
-    def search_issues(self, query: str, limit: int) -> IssueSearchOutcome:
+    def search_issues(
+        self, query: str, limit: int, *, scope: SearchScope | None = None
+    ) -> IssueSearchOutcome:
         raise ToolFailure(
             "mcp_not_configured",
             "GitHub MCP is disabled; local analysis can continue but remote history is not checked",
         )
 
-    def read_issue(self, issue_ref: str) -> IssueReadOutcome:
+    def read_issue(self, issue_ref: str, *, allow_any_repo: bool = False) -> IssueReadOutcome:
         raise ToolFailure(
             "mcp_not_configured",
             "GitHub MCP is disabled; remote issue bodies were not read",
@@ -413,6 +446,8 @@ class ToolExecutor:
         policy: Any | None = None,
         evidence_lookup: Callable[[str], bool] | None = None,
         evidence_store: EvidenceStore | None = None,
+        research: Any | None = None,
+        displayed_lookup: Callable[[str], bool] | None = None,
     ) -> None:
         self.workspace = workspace
         self.project_id = project_id
@@ -425,9 +460,19 @@ class ToolExecutor:
         self.policy = policy
         self.evidence_lookup = evidence_lookup
         self.evidence_store = evidence_store
+        self.research = research
+        self.displayed_lookup = displayed_lookup
         self._tool_scope = threading.local()
 
-    def execute(self, tool_name: str, arguments: dict[str, Any], *, call_id: str, turn: int) -> ToolResult:
+    def execute(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        call_id: str,
+        turn: int,
+        execution_context: Any | None = None,
+    ) -> ToolResult:
         if tool_name not in TOOL_DEFINITIONS:
             result = ToolResult(
                 status=ToolStatus.ERROR,
@@ -479,7 +524,7 @@ class ToolExecutor:
                 self._trace(tool_name, arguments, call_id, turn, denial, attempts, denied=True)
                 return denial
             self.budget.consume_tool_attempt()
-            result = self._run_with_timeout(tool_name, parsed)
+            result = self._run_with_timeout(tool_name, parsed, execution_context)
             result = self._policy_after_tool(tool_name, parsed, result, call_id=call_id, turn=turn)
             self._trace(tool_name, arguments, call_id, turn, result, attempts)
             if result.status == ToolStatus.OK or not result.retryable or attempts >= 2:
@@ -585,7 +630,12 @@ class ToolExecutor:
         )
 
     # -- dispatch -----------------------------------------------------------
-    def _run_with_timeout(self, tool_name: str, parsed: StrictModel) -> ToolResult:
+    def _run_with_timeout(
+        self,
+        tool_name: str,
+        parsed: StrictModel,
+        execution_context: Any | None = None,
+    ) -> ToolResult:
         timeout = self.budget.per_tool_timeout()
         outcome: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
         cancel = threading.Event()
@@ -593,12 +643,14 @@ class ToolExecutor:
         def work() -> None:
             self._tool_scope.cancel = cancel
             self._tool_scope.evidence = {}
+            self._tool_scope.context = execution_context
             try:
                 outcome.put(("ok", self._dispatch(tool_name, parsed)))
             except Exception as exc:  # noqa: BLE001 - handed back to the caller
                 outcome.put(("error", exc))
             finally:
                 self._tool_scope.cancel = None
+                self._tool_scope.context = None
 
         thread = threading.Thread(target=work, name="triage-tool", daemon=True)
         thread.start()
@@ -656,6 +708,8 @@ class ToolExecutor:
             result = self._github_search(parsed)  # type: ignore[arg-type]
         elif tool_name == "github_read_issue":
             result = self._github_read(parsed)  # type: ignore[arg-type]
+        elif tool_name == "record_issue_assessment":
+            result = self._record_assessment(parsed)  # type: ignore[arg-type]
         elif tool_name == "read_evidence":
             result = self._read_evidence(parsed)  # type: ignore[arg-type]
         else:  # guarded by caller
@@ -1107,9 +1161,34 @@ class ToolExecutor:
     def _github_search(self, args: GithubSearchIssuesArgs) -> ToolResult:
         if not self.github.available:
             raise ToolFailure(self.github.unavailable_reason or "mcp_unavailable", "GitHub MCP is unavailable")
-        outcome = self.github.search_issues(args.query, args.limit)
+        context = getattr(self._tool_scope, "context", None)
+        research = self.research
+        action = context if getattr(context, "kind", None) == "search" else None
+        scope: SearchScope | None = None
+        query = args.query
+        if research is not None:
+            if action is not None:
+                scope = action.scope
+                query = action.query or args.query
+            else:
+                if research.state.status == "done":
+                    raise ToolFailure("research_finished", "issue research already finished in this run")
+                scope = research.model_scope()
+                try:
+                    compiled = compile_query([args.query], scope)
+                except ScopeViolation as exc:
+                    raise ToolFailure(exc.code, str(exc)[:500]) from exc
+                query = compiled.rsplit(f" {scope.qualifier} is:issue", 1)[0]
+                if research.state.searches_used >= research.config.max_searches:
+                    raise ToolFailure("research_search_limit", "the configured layered search budget is exhausted")
+            if not research.note_remote_request():
+                raise ToolFailure("research_remote_limit", "the configured remote request budget is exhausted")
+            outcome = self.github.search_issues(query, args.limit, scope=scope)
+        else:
+            outcome = self.github.search_issues(query, args.limit)
         evidence_refs: list[str] = []
         issues: list[dict[str, Any]] = []
+        receipt_issues: list[Any] = []
         for issue in outcome.issues:
             url = str(issue.get("html_url") or issue.get("url") or "")
             if not url:
@@ -1136,26 +1215,159 @@ class ToolExecutor:
                     **self._capture_data(evidence),
                 }
             )
+            receipt_issues.append((issue, evidence.evidence_id))
         truncated = not outcome.complete
+        data: dict[str, Any] = {
+            "query": query,
+            "scope": outcome.query_scope,
+            "layer": outcome.layer,
+            "total_count": outcome.total_count,
+            "issues": issues,
+            "complete": outcome.complete,
+        }
+        if research is not None:
+            receipt, candidates = self._register_search_receipt(
+                research=research,
+                action=action,
+                scope=scope,
+                query=query,
+                call_id=context.call_id if action is not None else f"model-{len(research.state.receipts) + 1:03d}",
+                receipt_issues=receipt_issues,
+                complete=outcome.complete,
+                limit=args.limit,
+            )
+            data["receipt_id"] = receipt.receipt_id
+            data["candidates"] = [candidate.issue_ref for candidate in candidates]
+            data["search_evidence_id"] = receipt.evidence_id
         return ToolResult(
             status=ToolStatus.OK,
-            data={
-                "query": args.query,
-                "scope": outcome.query_scope,
-                "total_count": outcome.total_count,
-                "issues": issues,
-                "complete": outcome.complete,
-            },
+            data=data,
             evidence_refs=evidence_refs,
             truncated=truncated,
             continuation={"reason": "page_limited", "next": "narrow the query"} if truncated else None,
             duration_ms=0,
         )
 
+    def _register_search_receipt(
+        self,
+        *,
+        research: Any,
+        action: Any,
+        scope: SearchScope,
+        query: str,
+        call_id: str,
+        receipt_issues: list[tuple[dict[str, Any], str]],
+        complete: bool,
+        limit: int,
+    ) -> tuple[Any, list[Any]]:
+        from .contracts import IssueCandidate, ReceiptIssue, SearchReceipt
+        from .issue_research import ResearchAction
+
+        snapshot = json.dumps(
+            [issue for issue, _evidence in receipt_issues], ensure_ascii=False, sort_keys=True
+        )
+        snapshot_sha = hashlib.sha256(snapshot.encode()).hexdigest()
+        receipt_evidence = build_evidence(
+            kind=EvidenceKind.ISSUE,
+            project_id=self.project_id,
+            url="https://github.com",
+            snippet=snapshot,
+            sha256=snapshot_sha,
+        )
+        receipt_evidence = self._save_evidence(
+            receipt_evidence,
+            snapshot=snapshot,
+            capture_scope="github_response",
+            complete=complete,
+            notes=["search response snapshot bound to one receipt"],
+        )
+        digest = hashlib.sha256(
+            f"{self.run_id}|{scope.layer.value}|{scope.label}|{query}|{call_id}|{receipt_evidence.evidence_id}".encode()
+        ).hexdigest()[:12]
+        receipt = SearchReceipt(
+            receipt_id=f"rcpt-{digest}",
+            run_id=self.run_id,
+            layer=scope.layer,
+            scope=scope.label,
+            query_sha256=hashlib.sha256(query.encode()).hexdigest(),
+            call_id=call_id,
+            evidence_id=receipt_evidence.evidence_id,
+            snapshot_sha256=snapshot_sha,
+            issues=[
+                ReceiptIssue(
+                    issue_ref=str(issue.get("issue_ref")),
+                    number=int(issue.get("number")),
+                    title=str(issue.get("title") or "")[:500] or None,
+                    state=_issue_state(issue.get("state")),
+                    url=str(issue.get("html_url") or issue.get("url") or ""),
+                    evidence_id=evidence_id,
+                )
+                for issue, evidence_id in receipt_issues
+            ],
+            captured_at=datetime.now(timezone.utc),
+        )
+        candidates = [
+            IssueCandidate(
+                issue_ref=str(issue.get("issue_ref")),
+                layer=scope.layer,
+                owner=str(issue.get("owner") or str(issue.get("issue_ref", "")).split("/", 1)[0]),
+                repo=str(issue.get("repo") or str(issue.get("issue_ref", "")).split("/", 1)[1].split("#", 1)[0]),
+                number=int(issue.get("number")),
+                title=str(issue.get("title") or "")[:500] or None,
+                state=_issue_state(issue.get("state")),
+                url=str(issue.get("html_url") or issue.get("url") or ""),
+                receipt_id=receipt.receipt_id,
+                search_evidence_id=evidence_id,
+                updated_at=_parse_timestamp(issue.get("updated_at")),
+            )
+            for issue, evidence_id in receipt_issues
+        ]
+        if action is None:
+            action = ResearchAction(
+                kind="search",
+                call_id=f"model-{call_id}",
+                layer=scope.layer,
+                scope=scope,
+                query=query,
+                limit=limit,
+            )
+        research.accept_search(
+            action,
+            receipt=receipt,
+            candidates=candidates,
+            complete=complete,
+            coverage=None if complete else "search response may be paginated or incomplete",
+        )
+        return receipt, candidates
+
     def _github_read(self, args: GithubReadIssueArgs) -> ToolResult:
         if not self.github.available:
             raise ToolFailure(self.github.unavailable_reason or "mcp_unavailable", "GitHub MCP is unavailable")
-        outcome = self.github.read_issue(args.issue_ref)
+        context = getattr(self._tool_scope, "context", None)
+        research = self.research
+        action = context if getattr(context, "kind", None) == "read" else None
+        if research is not None:
+            if not research.can_read(args.issue_ref):
+                raise ToolFailure(
+                    "out_of_scope_issue",
+                    "issue_ref has no persisted search receipt from an authorized layer in this run",
+                )
+            if any(
+                candidate.issue_ref == args.issue_ref and candidate.read
+                for candidate in research.state.candidates
+            ):
+                raise ToolFailure("already_read", "this candidate body was already read in this run")
+            if research.state.status == "done":
+                raise ToolFailure("research_finished", "issue research already finished in this run")
+            if research.state.reads_used >= research.config.max_issue_reads:
+                raise ToolFailure("research_read_limit", "the configured issue read budget is exhausted")
+            if not research.note_remote_request():
+                raise ToolFailure("research_remote_limit", "the configured remote request budget is exhausted")
+            outcome = self.github.read_issue(args.issue_ref, allow_any_repo=True)
+            if outcome.issue.get("issue_ref") != args.issue_ref:
+                raise ToolFailure("ambiguous_issue_identity", "issue_read returned a different issue than requested")
+        else:
+            outcome = self.github.read_issue(args.issue_ref)
         snippet = json.dumps(
             {"issue": outcome.issue, "comments": outcome.comments, "comments_error": outcome.comments_error},
             ensure_ascii=False,
@@ -1170,19 +1382,77 @@ class ToolExecutor:
             truncated=len(snippet.encode()) > SNIPPET_MAX_BYTES,
         )
         evidence = self._save_evidence(evidence, snapshot=snippet, capture_scope="github_response", complete=False, notes=["captured backend response only; full comment pagination is not established", *([outcome.comments_error] if outcome.comments_error else [])])
+        data: dict[str, Any] = {
+            "issue": outcome.issue,
+            "comments": outcome.comments,
+            "updated_at": outcome.updated_at,
+            "comments_error": outcome.comments_error,
+            "comments_complete": outcome.comments_complete,
+            "evidence_id": evidence.evidence_id,
+            **self._capture_data(evidence),
+        }
+        if research is not None:
+            if action is None:
+                from .issue_research import ResearchAction
+
+                action = ResearchAction(
+                    kind="read",
+                    call_id=f"model-{len(research.state.receipts) + research.state.reads_used + 1:03d}",
+                    layer=research.state.layer,
+                    scope=research.current_scope(),
+                    issue_ref=args.issue_ref,
+                )
+            research.accept_read(action, evidence_id=evidence.evidence_id)
+            data["layer"] = action.layer.value
         return ToolResult(
             status=ToolStatus.OK,
-            data={
-                "issue": outcome.issue,
-                "comments": outcome.comments,
-                "updated_at": outcome.updated_at,
-                "comments_error": outcome.comments_error,
-                "evidence_id": evidence.evidence_id,
-                **self._capture_data(evidence),
-            },
+            data=data,
             evidence_refs=[evidence.evidence_id],
             truncated=evidence.truncated,
             continuation={"reason": "snippet_truncated", **self._continuation(evidence, len(evidence.snippet.encode()))} if evidence.truncated else None,
+            duration_ms=0,
+        )
+
+    def _record_assessment(self, args: RecordIssueAssessmentArgs) -> ToolResult:
+        research = self.research
+        if research is None:
+            raise ToolFailure("not_available", "layered issue research is not enabled for this run")
+        candidate = research.candidate(args.issue_ref)
+        if candidate is None:
+            raise ToolFailure(
+                "out_of_scope_issue",
+                "assessment references an issue that this run did not locate and read",
+            )
+        if not candidate.read:
+            raise ToolFailure("issue_not_read", "read the issue body before assessing it")
+        for evidence_id in args.evidence_refs:
+            if self.evidence_lookup is not None and not self.evidence_lookup(evidence_id):
+                raise ToolFailure("unknown_evidence", "assessment cites evidence that is not registered in this run")
+            if self.displayed_lookup is not None and not self.displayed_lookup(evidence_id):
+                raise ToolFailure(
+                    "assessment_evidence_not_displayed",
+                    "assessment cites evidence the model has not received in a request",
+                )
+        assessment = IssueAssessment(
+            issue_ref=args.issue_ref,
+            component=args.component,
+            symptom=args.symptom,
+            version=args.version,
+            environment=args.environment,
+            trigger=args.trigger,
+            fix=args.fix,
+            evidence_refs=args.evidence_refs,
+            note=args.note,
+            recorded_at=datetime.now(timezone.utc),
+        )
+        return ToolResult(
+            status=ToolStatus.OK,
+            data={
+                "status": "pending_commit",
+                "assessment": assessment.model_dump(mode="json"),
+                "applicable": assessment.applicable,
+            },
+            evidence_refs=[],
             duration_ms=0,
         )
 
@@ -1351,6 +1621,19 @@ def redact_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         return value
 
     return scrub(arguments)
+
+
+def _issue_state(value: Any) -> Literal["open", "closed", "unknown"]:
+    return value if value in {"open", "closed"} else "unknown"
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def evidence_snippet_from_store(evidence: Evidence) -> str:

@@ -171,7 +171,7 @@ def test_outcome_rejects_strict_bool_and_bad_hash() -> None:
 
 def test_default_layers_fit_total_budget() -> None:
     limits = ContextLimits()
-    assert limits.total_input_tokens == 12_000
+    assert limits.total_input_tokens == 12_400
     with pytest.raises(ValidationError):
         ContextLimits(current_evidence_tokens=50_000)
 

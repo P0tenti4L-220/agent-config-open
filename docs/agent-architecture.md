@@ -17,7 +17,8 @@
 |---|---|
 | `contracts.py`、`config.py` | Pydantic 严格契约、配置和非凭据指纹 |
 | `models.py` | Replay、Anthropic、DeepSeek provider |
-| `tools.py`、`mcp_client.py` | 七个受限工具与只读 GitHub 协议适配 |
+| `tools.py`、`mcp_client.py` | 八个受限工具与只读 GitHub 协议适配 |
+| `project_profile.py`、`github_scope.py`、`issue_research.py` | 项目画像、检索范围与真实 Issue 身份、分层状态机 |
 | `windows.py`、`state_projection.py` | 原文窗口选择、失败与无进展状态投影 |
 | `cursors.py`、`store.py` | 已捕获快照、版本绑定游标与本地续读 |
 | `policy.py`、`playbooks.py` | 固定规则与三类诊断 playbook |
@@ -30,7 +31,7 @@
 
 ## 边界
 
-模型仅能使用 `read_file`、`search_text`、`git_status`、`search_lessons`、`github_search_issues`、`github_read_issue`、`read_evidence`。参数校验和根目录约束由程序实施；模型不能添加任意工具或执行 shell。GitHub 仅查询显式配置的仓库。
+模型仅能使用 `read_file`、`search_workspace`、`get_git_context`、`search_lessons`、`github_search_issues`、`github_read_issue`、`record_issue_assessment`、`read_evidence`。参数校验和根目录约束由程序实施；模型不能添加任意工具或执行 shell。GitHub 默认只查询显式配置的仓库；启用分层检索后，程序按配置允许的依赖映射与公共回退逐层搜索，模型不能指定 `repo:` 或层级。
 
 `read_evidence` 只读取当前运行登记的快照，仍计入工具与时间预算。窗口选择只使用已入库片段；更远的已捕获内容需先续读成新证据。来源已变化时保留历史快照并标为 `stale`，不与当前文件拼接。详见[上下文选择与快照续读](context-selection.md)。
 

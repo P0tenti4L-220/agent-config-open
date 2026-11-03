@@ -11,9 +11,22 @@
 
 ## 本次同步（2026-11-03）
 
-已同步精确原文窗口、关键调查状态和 `read_evidence` 快照续读，以及相应合成回归样例。当前工具数为七个；运行时使用 `prompt-v3` / `tools-v2`，新展示证明为 v3，旧 v2 只按旧契约读取。详见 [context-selection.md](context-selection.md) 与本轮 [verification.md](verification.md)。
+已同步精确原文窗口、关键调查状态和 `read_evidence` 快照续读，以及相应合成回归样例。该轮工具数为七个；运行时使用 `prompt-v3` / `tools-v2`，新展示证明为 v3，旧 v2 只按旧契约读取。详见 [context-selection.md](context-selection.md) 与本轮 [verification.md](verification.md)。
 
 公开范围仍为诊断 Agent、合成测试和通用文档；未导入个人规则、备份工具、配置或运行数据。本次没有执行真实模型、真实 GitHub MCP 或人工质量实验，均为 `not_run`。
+
+## 本次同步（2026-11-03）：分层 Issue 检索
+
+新增 `project_profile.py`、`github_scope.py`、`issue_research.py`，并由 Runner 在每次模型请求前执行程序计划：
+
+- 项目画像有界读取 `pyproject.toml`、`uv.lock`、`requirements*.txt` 和本地 `.git/config`；声明版本、锁定版本与未知状态分开记录，不执行项目代码。
+- 搜索范围由配置上限和控制器决定；模型查询拒绝 `repo:`、`org:`、`is:`、布尔运算、否定和引号。依赖层只使用配置中的“包 → 上游仓库”映射。
+- 候选身份从响应中的仓库字段、API/HTML URL 或 `issue_ref` 交叉核对；跨仓库后保留真实 `owner/repo#number`，不再用 `mcp.repo` 拼接。
+- 搜索回执绑定 run、层级、范围、查询 hash、调用 id、证据快照与候选列表，写入 checkpoint；`issue-research.json` 记录逐层过程。
+- 新工具 `record_issue_assessment` 记录六个维度的 `match`/`mismatch`/`unknown`；程序校验候选已读、证据已展示后提交，`component`/`symptom` 匹配且无冲突才停止扩大。
+- 最终 `analysis.related_issues` 与报告中的“分层 Issue 检索”保留层级和适用性；适用线索不升级为已确认根因。
+
+运行时版本为 `policy-v2` / `prompt-v4` / `tools-v3`；`Config v1` 默认仍是单仓库 legacy 行为，layered 模式要求 `schema_version = 2`。真实模型 / MCP 分层联调为 `not_run`。
 
 ## 接下来优先处理
 
