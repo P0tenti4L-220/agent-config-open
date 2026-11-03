@@ -2,6 +2,30 @@
 
 本文件只记录公开版自己的运行结果，不引用私人仓库的历史数字。
 
+## 2026-11-03：上下文与快照续读同步
+
+环境：macOS、Python 3.11.9。公开副本使用独立虚拟环境和锁定依赖；没有复制本机配置、凭据或真实运行数据。
+
+| 实际执行 | 退出码 | 观察到的结果 |
+|---|---|---|
+| `uv sync --frozen --extra dev --offline` | 0 | 从本机缓存安装锁定的 40 个包，导入来自公开副本 |
+| `python -m pytest -m 'not live' -q` | 0 | 222 passed、1 deselected；覆盖原文窗口、快照游标、历史展示证明和既有回归样例 |
+| `agent-triage demo --output local/sync-demo` | 0 | 生成 report、context、handoff；`partial` 明确保留 GitHub 未配置的缺口 |
+| `agent-triage doctor --profile offline --output local/sync-doctor` | 0 | `ready`；网络和真实模型调用仍为 `not_run` |
+| `agent-triage eval --cases tests/cases --output local/sync-eval` | 0 | 62 项：54 pass、0 fail、0 error、8 not_run；整体 `partial` |
+| `agent-triage accept --profile offline --evidence-dir <evaluation_dir>` | 0 | 整理本记录前的工作快照为 54/54 `current+pass` |
+| `python3 scripts/check-public.py` | 0 | 检查 161 个索引内文本文件，无配置模式命中；另人工核对公开范围和文档差异 |
+| `git diff --cached --check` | 0 | 暂存差异无空白错误 |
+| 本地 Markdown 链接检查（Python） | 0 | 32 个本地文件链接均可解析 |
+
+新增工具为 `read_evidence`，运行时为 `prompt-v3` / `tools-v2`；新展示证明为 v3。证据捕获、窗口和游标的边界见 [context-selection.md](context-selection.md)。原有对抗样例和公开版脱敏适配保留。
+
+验收绑定运行时的 commit 和整个文件快照，修改本记录也会使旧结果失效。最终提交的 `eval` / `accept` 结果应在对应 PR 中单独记录，本表不能代替当前目标检查。以上为本地执行结果；本仓库没有自动 CI 门禁。
+
+本轮真实模型 / GitHub MCP、人工质量评审、配对质量 / 成本 / 耗时实验、发行包构建及 Windows / Linux 运行均为 `not_run`。下方真实 DeepSeek 与构建记录属于首次公开发行，不是本轮重跑结果。
+
+## 2026-10-28：首次公开发行（历史记录）
+
 日期：2026-10-28。环境：macOS、Python 3.11.9；在独立虚拟环境中安装公开副本，没有复用私人项目的 Python 导入路径。
 
 | 实际执行 | 退出码 | 观察到的结果 |

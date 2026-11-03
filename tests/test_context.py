@@ -268,12 +268,12 @@ def test_protocol_compaction_keeps_complete_pairs(tmp_path: Path) -> None:
         tmp_path,
         limits=ContextLimits(
             constraints_tokens=300,
-            tool_definitions_tokens=800,
+            tool_definitions_tokens=1300,
             task_facts_tokens=300,
             current_evidence_tokens=300,
             history_tokens=100,
             working_state_tokens=200,
-            total_input_tokens=2000,
+            total_input_tokens=2500,
         ),
         conversation=conversation,
     )

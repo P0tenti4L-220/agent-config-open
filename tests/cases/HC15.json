@@ -7,6 +7,6 @@
   "pytest": [
     "tests/test_harness_catalog.py::test_acceptance_commands_are_not_model_tools"
   ],
-  "expectation": "模型仍只有六个受限工具；accept/doctor/record-review 只由本机操作者显式执行，未知工具被拒绝并留 trace。",
+  "expectation": "模型仍只有七个受限工具；accept/doctor/record-review 只由本机操作者显式执行，未知工具被拒绝并留 trace。",
   "status": "not_run"
 }

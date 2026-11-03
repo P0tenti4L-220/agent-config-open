@@ -7,7 +7,7 @@
 1. `cli.py` / `ingest.py` 校验事件、日志与项目根。
 2. `pipeline.py` 组装模型、可选 MCP、证据与本地存储。
 3. `runner.py` 执行有次数和时间预算的模型 / 工具循环。
-4. `context.py` 优先保留当前问题、必要证据与反证，并记录省略影响。
+4. `context.py` / `windows.py` 选择相关原文窗口，优先保留必要证据与反证，并记录精确范围和省略影响；`state_projection.py` 保留关键调查状态。
 5. `claims.py`、`request_views.py`、`lifecycle.py` 检查结构、引用、展示与运行约束。
 6. `render.py` 输出报告、上下文与交接材料。
 
@@ -17,7 +17,9 @@
 |---|---|
 | `contracts.py`、`config.py` | Pydantic 严格契约、配置和非凭据指纹 |
 | `models.py` | Replay、Anthropic、DeepSeek provider |
-| `tools.py`、`mcp_client.py` | 六个受限工具与只读 GitHub 协议适配 |
+| `tools.py`、`mcp_client.py` | 七个受限工具与只读 GitHub 协议适配 |
+| `windows.py`、`state_projection.py` | 原文窗口选择、失败与无进展状态投影 |
+| `cursors.py`、`store.py` | 已捕获快照、版本绑定游标与本地续读 |
 | `policy.py`、`playbooks.py` | 固定规则与三类诊断 playbook |
 | `budget.py`、`runner.py` | 请求 / 工具 / 时间预算、重复调用与恢复 |
 | `store.py`、`feedback.py`、`review.py` | 运行存储、经验反馈和外部复核 |
@@ -28,7 +30,9 @@
 
 ## 边界
 
-模型仅能使用 `read_file`、`search_text`、`git_status`、`search_lessons`、`github_search_issues`、`github_read_issue`。参数校验和根目录约束由程序实施；模型不能添加任意工具或执行 shell。GitHub 仅查询显式配置的仓库。
+模型仅能使用 `read_file`、`search_text`、`git_status`、`search_lessons`、`github_search_issues`、`github_read_issue`、`read_evidence`。参数校验和根目录约束由程序实施；模型不能添加任意工具或执行 shell。GitHub 仅查询显式配置的仓库。
+
+`read_evidence` 只读取当前运行登记的快照，仍计入工具与时间预算。窗口选择只使用已入库片段；更远的已捕获内容需先续读成新证据。来源已变化时保留历史快照并标为 `stale`，不与当前文件拼接。详见[上下文选择与快照续读](context-selection.md)。
 
 日志、源码、issue 与历史经验都作为不可信材料。当前实现包含路径与凭据模式拦截，但证据正文仍进入模型上下文；不能据此声称已彻底隔离提示注入或所有隐私泄漏。
 

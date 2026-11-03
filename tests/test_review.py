@@ -297,11 +297,20 @@ def test_review_becomes_stale_when_evidence_changes(tmp_path: Path) -> None:
     ) == 0
     evidence_path = store.dir / "evidence" / "index.json"
     index = read_json(evidence_path)
-    index["evidence"][0]["snippet"] = index["evidence"][0]["snippet"] + "\nchanged"
+    changed = index["evidence"][0]
+    changed["snippet"] += "\nchanged"
+    raw = changed["snippet"].encode()
+    # Keep the new capture internally consistent. Old request/display/review
+    # records still bind the previous source and must not verify the new one.
+    digest = __import__("hashlib").sha256(raw).hexdigest()
+    changed.update(sha256=digest, snapshot_sha256=digest, snapshot_bytes=len(raw),
+                   snapshot_start_byte=0, snapshot_end_byte=len(raw))
+    (store.dir / "evidence/objects" / f"{digest}.txt").write_bytes(raw)
     evidence_path.write_text(json.dumps(index), encoding="utf-8")
-    assert cli.main(["validate", "--run-id", store.run_id, "--output", str(output)]) == 0
+    assert cli.main(["validate", "--run-id", store.run_id, "--output", str(output)]) == 1
     view = read_json(store.dir / "review-status.json")
     assert view["overall"] == "not_run"
     assert payload["review_id"] in view["stale_review_ids"]
     checks = {item["check_id"]: item for item in read_json(store.dir / "checks.json")["checks"]}
     assert checks["claim-support"]["status"] == "not_run"
+    assert checks["claim-display"]["status"] == "fail"

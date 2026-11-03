@@ -24,6 +24,7 @@ from pydantic import Field, ValidationError, field_validator
 from .budget import Budget
 from .contracts import (
     Evidence,
+    EvidenceId,
     EvidenceKind,
     LessonSummary,
     LineNumber,
@@ -38,12 +39,15 @@ from .contracts import (
     TraceKind,
     TraceRecord,
 )
-from .errors import ToolFailure
+from .errors import InputError, StoreError, ToolFailure
 from .ingest import MAX_INPUT_BYTES
 from .lifecycle import Decision, LifecycleEvent
-from .store import LessonStore, SENSITIVE_DIRS, SENSITIVE_PARTS, SENSITIVE_SUFFIXES, hash_file
+from .store import EvidenceStore, LessonStore, SENSITIVE_DIRS, SENSITIVE_PARTS, SENSITIVE_SUFFIXES, hash_file
+from .cursors import make_cursor, read_cursor
+from .windows import MAX_WINDOW_BYTES, make_window, select_windows
 
 READ_MAX_BYTES = 8 * 1024
+TOOL_RESULT_MAX_BYTES = 8 * 1024
 SCAN_MAX_BYTES = 8 * 1024 * 1024
 SCAN_MAX_FILES = 5000
 SCAN_FILE_BYTES = 2 * 1024 * 1024
@@ -112,6 +116,12 @@ class GithubReadIssueArgs(StrictModel):
     issue_ref: ShortStr = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$")
 
 
+class ReadEvidenceArgs(StrictModel):
+    evidence_id: EvidenceId
+    cursor: str | None = Field(default=None, min_length=1, max_length=1500)
+    max_bytes: StrictInt = Field(default=8192, ge=4, le=8192)
+
+
 TOOL_DEFINITIONS: dict[str, tuple[type[StrictModel], str]] = {
     "read_file": (
         ReadFileArgs,
@@ -142,6 +152,12 @@ TOOL_DEFINITIONS: dict[str, tuple[type[StrictModel], str]] = {
         GithubReadIssueArgs,
         "Read one issue and bounded comments. issue_ref must come from github_search_issues in "
         "this run and belong to the configured repository.",
+    ),
+    "read_evidence": (
+        ReadEvidenceArgs,
+        "Read a bounded page from a snapshot registered in this run only. "
+        "Use its opaque cursor to continue the same source version, including within a long line. "
+        "No path, URL, shell or network access; uncaptured content remains unknown.",
     ),
 }
 
@@ -268,6 +284,18 @@ def truncate_utf8(text: str, max_bytes: int) -> str:
     return ""
 
 
+def _casefold_match_start(text: str, needle: str) -> int | None:
+    position = text.casefold().find(needle)
+    if position < 0:
+        return None
+    folded_offset = 0
+    for index, char in enumerate(text):
+        folded_offset += len(char.casefold())
+        if folded_offset > position:
+            return index
+    return None
+
+
 def build_evidence(
     *,
     kind: EvidenceKind,
@@ -281,8 +309,11 @@ def build_evidence(
     commit: str | None = None,
     url: str | None = None,
     truncated: bool = False,
+    byte_offset: int | None = None,
 ) -> Evidence:
+    original_snippet = snippet
     snippet = truncate_utf8(snippet, SNIPPET_MAX_BYTES)
+    truncated = truncated or snippet != original_snippet
     digest = hashlib.sha256(snippet.encode("utf-8")).hexdigest()
     identity = "|".join(
         [
@@ -293,6 +324,7 @@ def build_evidence(
             str(line_end or ""),
             sha256 or "",
             digest,
+            str(byte_offset) if byte_offset is not None else "",
         ]
     )
     evidence_id = f"ev-{hashlib.sha256(identity.encode()).hexdigest()[:12]}"
@@ -380,6 +412,7 @@ class ToolExecutor:
         run_id: str = "run-unknown",
         policy: Any | None = None,
         evidence_lookup: Callable[[str], bool] | None = None,
+        evidence_store: EvidenceStore | None = None,
     ) -> None:
         self.workspace = workspace
         self.project_id = project_id
@@ -391,6 +424,7 @@ class ToolExecutor:
         self.run_id = run_id
         self.policy = policy
         self.evidence_lookup = evidence_lookup
+        self.evidence_store = evidence_store
         self._tool_scope = threading.local()
 
     def execute(self, tool_name: str, arguments: dict[str, Any], *, call_id: str, turn: int) -> ToolResult:
@@ -558,6 +592,7 @@ class ToolExecutor:
 
         def work() -> None:
             self._tool_scope.cancel = cancel
+            self._tool_scope.evidence = {}
             try:
                 outcome.put(("ok", self._dispatch(tool_name, parsed)))
             except Exception as exc:  # noqa: BLE001 - handed back to the caller
@@ -595,7 +630,7 @@ class ToolExecutor:
             return ToolResult(
                 status=ToolStatus.ERROR,
                 error_code=value.code,
-                data={"message": value.message},
+                data={"message": truncate_utf8(value.message, 1500)},
                 retryable=value.retryable,
                 duration_ms=0,
             )
@@ -621,22 +656,21 @@ class ToolExecutor:
             result = self._github_search(parsed)  # type: ignore[arg-type]
         elif tool_name == "github_read_issue":
             result = self._github_read(parsed)  # type: ignore[arg-type]
+        elif tool_name == "read_evidence":
+            result = self._read_evidence(parsed)  # type: ignore[arg-type]
         else:  # guarded by caller
             raise ToolFailure("unknown_tool", tool_name)
         elapsed = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-        return result.model_copy(update={"duration_ms": elapsed})
+        return self._bound_result(result.model_copy(update={"duration_ms": elapsed}))
 
     # -- tools --------------------------------------------------------------
     def _read_file(self, args: ReadFileArgs) -> ToolResult:
         payload, text = self.workspace.read_bytes(args.path)
         sha = hashlib.sha256(payload).hexdigest()
-        lines = text.splitlines()
+        lines = text.splitlines(keepends=True)
         start = args.start_line
         if start > len(lines):
-            raise ToolFailure(
-                "line_out_of_range",
-                f"{args.path} has {len(lines)} lines; start_line={start}",
-            )
+            raise ToolFailure("line_out_of_range", f"{args.path} has {len(lines)} lines; start_line={start}")
         selected: list[str] = []
         used = 0
         index = start - 1
@@ -644,61 +678,123 @@ class ToolExecutor:
         skipped_long_line = False
         while index < len(lines) and len(selected) < args.max_lines:
             line = lines[index]
-            encoded = (line + "\n").encode("utf-8")
-            if len(encoded) > READ_MAX_BYTES - used:
+            if len(line.encode()) > READ_MAX_BYTES - used:
                 if not selected:
-                    line = truncate_utf8(line, READ_MAX_BYTES)
-                    selected.append(line)
+                    selected.append(truncate_utf8(line, READ_MAX_BYTES))
                     line_truncated = True
                     index += 1
                 else:
                     skipped_long_line = True
                 break
             selected.append(line)
-            used += len(encoded)
+            used += len(line.encode())
             index += 1
-        end = start + len(selected) - 1 if selected else start - 1
-        more = index < len(lines)
+        end = start + len(selected) - 1
+        snippet = "".join(selected)
+        start_byte = len("".join(lines[:start - 1]).encode())
+        more = start_byte + len(snippet.encode()) < len(payload)
+        evidence = build_evidence(
+            kind=EvidenceKind.LOCAL_FILE, project_id=self.project_id,
+            path=args.path, line_start=start, line_end=end, sha256=sha,
+            total_lines=len(lines), snippet=snippet, truncated=more,
+        )
+        evidence = self._save_evidence(evidence, snapshot=text, start_byte=start_byte,
+                                       capture_scope="file", complete=True)
         continuation = {"start_line": index + 1} if more else None
         if line_truncated or skipped_long_line:
-            continuation = {
-                "reason": "line_too_long",
-                "next": (
-                    "the line exceeded the 8 KiB read limit; split the source, "
-                    "read the next line range, or use search_workspace"
-                ),
-            }
-            if more:
+            continuation = {"reason": "line_too_long"}
+            if index < len(lines):
                 continuation["next_line"] = index + 1
-        snippet = "\n".join(selected)
-        evidence = build_evidence(
-            kind=EvidenceKind.LOCAL_FILE,
-            project_id=self.project_id,
-            path=args.path,
-            line_start=start,
-            line_end=end,
-            sha256=sha,
-            total_lines=len(lines),
-            snippet=snippet,
-            truncated=bool(continuation or line_truncated),
-        )
-        evidence = self._save_evidence(evidence)
-        data = {
-            "path": args.path,
-            "start_line": start,
-            "end_line": end,
-            "total_lines": len(lines),
-            "sha256": sha,
-            "lines": [{"line": start + offset, "text": value} for offset, value in enumerate(selected)],
-            "line_truncated": line_truncated,
-            "skipped_long_line": skipped_long_line,
-        }
+        if more:
+            continuation = {**(continuation or {}), **self._continuation(evidence, start_byte + len(snippet.encode()))}
         return ToolResult(
             status=ToolStatus.OK,
-            data=data,
-            evidence_refs=[evidence.evidence_id],
-            truncated=bool(continuation),
-            continuation=continuation,
+            data={"path": args.path, "start_line": start, "end_line": end,
+                  "total_lines": len(lines), "sha256": sha,
+                  "lines": [{"line": start + offset, "text": value.rstrip("\r\n")}
+                            for offset, value in enumerate(selected)],
+                  "line_truncated": line_truncated, "skipped_long_line": skipped_long_line,
+                  **self._capture_data(evidence)},
+            evidence_refs=[evidence.evidence_id], truncated=more,
+            continuation=continuation, duration_ms=0,
+        )
+
+    def _read_evidence(self, args: ReadEvidenceArgs) -> ToolResult:
+        if self.evidence_store is None:
+            raise ToolFailure("evidence_unavailable", "this executor has no run evidence store")
+        try:
+            root = self.evidence_store.require(args.evidence_id)
+            text = self.evidence_store.capture_text(root.evidence_id)
+        except InputError as exc:
+            raise ToolFailure("unknown_evidence", "evidence is not registered in this run") from exc
+        except StoreError as exc:
+            code = "snapshot_missing" if "missing" in exc.message else "snapshot_corrupt"
+            raise ToolFailure(code, exc.message) from exc
+        # Validate current local access policy, but never re-read a live source
+        # to replace this object's bytes. Missing sources can still be historical.
+        stale = root.stale
+        stale_reason = root.stale_reason
+        if root.path and root.kind == EvidenceKind.LOCAL_FILE:
+            path = self.workspace.resolve(root.path, must_exist=False)
+            try:
+                current_hash = hash_file(path) if path.stat().st_size <= MAX_INPUT_BYTES else "source_too_large"
+            except OSError:
+                current_hash = None
+            stale = current_hash != root.sha256
+            stale_reason = ("source_missing" if current_hash is None else "source_changed") if stale else None
+        raw = text.encode("utf-8")
+        start = read_cursor(args.cursor, self.run_id, root, raw) if args.cursor else (root.snapshot_start_byte or 0)
+        initial_end = root.snapshot_end_byte if root.snapshot_end_byte is not None else len(raw)
+        stop = len(raw) if args.cursor else initial_end
+        fragment = truncate_utf8(raw[start:stop].decode("utf-8"), min(args.max_bytes, MAX_WINDOW_BYTES))
+        if not fragment:
+            raise ToolFailure("empty_capture", "no captured bytes at this position")
+        end = start + len(fragment.encode())
+        base_line = root.snapshot_line_start or root.line_start or 1
+        line_start = base_line + raw[:start].count(b"\n")
+        # A range's identity includes offsets even when repeated text occurs.
+        identity = "|".join([root.kind.value, root.path or root.url or "", root.sha256,
+                             root.snapshot_sha256 or hashlib.sha256(raw).hexdigest(),
+                             str(start), str(end), hashlib.sha256(fragment.encode()).hexdigest()])
+        page = Evidence(
+            schema_version=2, evidence_id="ev-" + hashlib.sha256(identity.encode()).hexdigest()[:12],
+            kind=root.kind, project_id=root.project_id, path=root.path, url=root.url,
+            line_start=line_start if root.kind == EvidenceKind.LOCAL_FILE else None,
+            line_end=(line_start + fragment.count("\n") - int(fragment.endswith("\n"))) if root.kind == EvidenceKind.LOCAL_FILE else None,
+            sha256=root.sha256, snippet=fragment, captured_at=root.captured_at,
+            truncated=end < len(raw), total_lines=root.total_lines, commit=root.commit,
+            stale=stale, stale_reason=stale_reason,
+            parent_evidence_id=root.parent_evidence_id or root.evidence_id,
+        )
+        existing = next((item for item in self.evidence_store.all()
+                         if item.snapshot_sha256 == root.snapshot_sha256
+                         and item.snapshot_sha256 is not None
+                         and item.sha256 == root.sha256 and item.kind == root.kind
+                         and item.path == root.path and item.url == root.url
+                         and item.capture_scope == root.capture_scope
+                         and item.snapshot_line_start == root.snapshot_line_start
+                         and item.snapshot_start_byte == start and item.snapshot_end_byte == end), None)
+        page = existing or self._save_evidence(page, snapshot=text, start_byte=start,
+                                              capture_scope=root.capture_scope,
+                                              complete=root.complete_within_scope,
+                                              notes=root.capture_notes)
+        if stale:
+            self.evidence_store.mark_source_stale(root, stale_reason or "source_changed")
+            page = self.evidence_store.require(page.evidence_id)
+        records = getattr(self._tool_scope, "evidence", None)
+        if records is not None:
+            records[page.evidence_id] = page
+        next_cursor = make_cursor(self.run_id, root, end) if end < len(raw) else None
+        return ToolResult(
+            status=ToolStatus.OK,
+            data={"parent_evidence_id": root.evidence_id, "evidence_id": page.evidence_id,
+                  "source_sha256": root.sha256, "start_byte": start, "end_byte": end,
+                  "stale": page.stale, "stale_reason": page.stale_reason,
+                  "next_cursor": next_cursor, "cursor_evidence_id": root.evidence_id,
+                  **self._capture_data(page)},
+            evidence_refs=[page.evidence_id], truncated=end < len(raw),
+            continuation={"tool": "read_evidence", "evidence_id": root.evidence_id,
+                          "cursor": next_cursor} if next_cursor else None,
             duration_ms=0,
         )
 
@@ -751,22 +847,25 @@ class ToolExecutor:
                     scan_truncated = True
                     break
                 try:
-                    payload = path.read_bytes()
-                except OSError:
+                    payload, text = self.workspace.read_bytes(relative)
+                except ToolFailure as exc:
+                    if exc.code not in {"invalid_utf8", "unsupported_binary"}:
+                        scan_truncated = True
                     continue
                 bytes_scanned += len(payload)
                 files_scanned += 1
-                if b"\x00" in payload[:8192]:
-                    continue
-                try:
-                    text = payload.decode("utf-8")
-                except UnicodeDecodeError:
-                    continue
                 sha = hashlib.sha256(payload).hexdigest()
                 for line_number, line in enumerate(text.splitlines(), start=1):
-                    if needle not in line.casefold():
+                    match_start = _casefold_match_start(line, needle)
+                    if match_start is None:
                         continue
-                    shortened = truncate_utf8(line, 500)
+                    # The search excerpt must contain the hit, including when
+                    # it is well past the first 500 bytes of a long line.
+                    anchor = max(0, match_start - 70)
+                    shortened = truncate_utf8(line[anchor:], 500)
+                    if args.query.casefold() not in shortened.casefold():
+                        anchor = match_start
+                        shortened = truncate_utf8(line[anchor:], 500)
                     evidence = build_evidence(
                         kind=EvidenceKind.LOCAL_FILE,
                         project_id=self.project_id,
@@ -777,8 +876,13 @@ class ToolExecutor:
                         total_lines=text.count("\n") + (0 if text.endswith("\n") else 1),
                         snippet=shortened,
                         truncated=len(shortened) < len(line),
+                        byte_offset=len(line[:anchor].encode()),
                     )
-                    evidence = self._save_evidence(evidence)
+                    evidence = self._save_evidence(
+                        evidence, snapshot=line, start_byte=len(line[:anchor].encode()),
+                        capture_scope="search_match", complete=True,
+                        notes=["only this matched line was captured; other file content was not archived"],
+                    )
                     evidence_refs.append(evidence.evidence_id)
                     line_truncated = line_truncated or len(shortened) < len(line)
                     matches.append(
@@ -788,6 +892,7 @@ class ToolExecutor:
                             "text": shortened,
                             "evidence_id": evidence.evidence_id,
                             "line_truncated": len(shortened) < len(line),
+                            **self._capture_data(evidence),
                         }
                     )
                     if len(matches) >= args.limit:
@@ -865,10 +970,10 @@ class ToolExecutor:
                 sha256=hashlib.sha256(snippet.encode()).hexdigest(),
                 snippet=snippet,
             )
-            evidence = self._save_evidence(evidence)
+            evidence = self._save_evidence(evidence, snapshot=snippet, capture_scope="git_output", complete=True)
             return ToolResult(
                 status=ToolStatus.OK,
-                data={"commit": None, "dirty": None, "files": file_hashes, "diff": None, "diff_truncated": False},
+                data={"commit": None, "dirty": None, "files": file_hashes, "diff": None, "diff_truncated": False, **self._capture_data(evidence)},
                 evidence_refs=[evidence.evidence_id],
                 duration_ms=0,
             )
@@ -896,7 +1001,7 @@ class ToolExecutor:
             commit=commit,
             truncated=diff_truncated,
         )
-        evidence = self._save_evidence(evidence)
+        evidence = self._save_evidence(evidence, snapshot=snippet, capture_scope="git_output", complete=not diff_truncated, notes=["git subprocess capture may be partial"] if diff_truncated else [])
         return ToolResult(
             status=ToolStatus.OK,
             data={
@@ -905,6 +1010,7 @@ class ToolExecutor:
                 "files": file_hashes,
                 "diff": diff,
                 "diff_truncated": diff_truncated,
+                **self._capture_data(evidence),
             },
             evidence_refs=[evidence.evidence_id],
             truncated=diff_truncated,
@@ -974,6 +1080,7 @@ class ToolExecutor:
             raise ToolFailure("lessons_unavailable", "no local lesson store is configured")
         lessons = self.lesson_store.search(args.query, args.limit)
         evidence_refs: list[str] = []
+        windows: list[dict[str, Any]] = []
         for lesson in lessons:
             snippet = json.dumps(lesson.model_dump(mode="json"), ensure_ascii=False, indent=2)
             evidence = build_evidence(
@@ -982,14 +1089,16 @@ class ToolExecutor:
                 snippet=snippet,
                 sha256=hashlib.sha256(snippet.encode()).hexdigest(),
             )
-            evidence = self._save_evidence(evidence)
+            evidence = self._save_evidence(evidence, snapshot=snippet, capture_scope="lesson", complete=True, notes=[])
             evidence_refs.append(evidence.evidence_id)
+            windows.extend(self._capture_data(evidence)["evidence_windows"])
         return ToolResult(
             status=ToolStatus.OK,
             data={
                 "query": args.query,
                 "lessons": [lesson.model_dump(mode="json") for lesson in lessons],
                 "note": "candidate lessons are reference material, not confirmed facts",
+                "evidence_windows": windows,
             },
             evidence_refs=evidence_refs,
             duration_ms=0,
@@ -1013,7 +1122,7 @@ class ToolExecutor:
                 snippet=snippet,
                 sha256=hashlib.sha256(snippet.encode()).hexdigest(),
             )
-            evidence = self._save_evidence(evidence)
+            evidence = self._save_evidence(evidence, snapshot=snippet, capture_scope="github_response", complete=False, notes=["search candidate only; issue body and comment completeness are not established"])
             evidence_refs.append(evidence.evidence_id)
             issues.append(
                 {
@@ -1024,6 +1133,7 @@ class ToolExecutor:
                     "url": url,
                     "updated_at": issue.get("updated_at"),
                     "evidence_id": evidence.evidence_id,
+                    **self._capture_data(evidence),
                 }
             )
         truncated = not outcome.complete
@@ -1047,7 +1157,7 @@ class ToolExecutor:
             raise ToolFailure(self.github.unavailable_reason or "mcp_unavailable", "GitHub MCP is unavailable")
         outcome = self.github.read_issue(args.issue_ref)
         snippet = json.dumps(
-            {"issue": outcome.issue, "comments": outcome.comments},
+            {"issue": outcome.issue, "comments": outcome.comments, "comments_error": outcome.comments_error},
             ensure_ascii=False,
             indent=2,
         )
@@ -1059,7 +1169,7 @@ class ToolExecutor:
             sha256=hashlib.sha256(snippet.encode()).hexdigest(),
             truncated=len(snippet.encode()) > SNIPPET_MAX_BYTES,
         )
-        evidence = self._save_evidence(evidence)
+        evidence = self._save_evidence(evidence, snapshot=snippet, capture_scope="github_response", complete=False, notes=["captured backend response only; full comment pagination is not established", *([outcome.comments_error] if outcome.comments_error else [])])
         return ToolResult(
             status=ToolStatus.OK,
             data={
@@ -1068,23 +1178,127 @@ class ToolExecutor:
                 "updated_at": outcome.updated_at,
                 "comments_error": outcome.comments_error,
                 "evidence_id": evidence.evidence_id,
+                **self._capture_data(evidence),
             },
             evidence_refs=[evidence.evidence_id],
             truncated=evidence.truncated,
-            continuation={"reason": "snippet_truncated", "next": "read comments in smaller ranges"} if evidence.truncated else None,
+            continuation={"reason": "snippet_truncated", **self._continuation(evidence, len(evidence.snippet.encode()))} if evidence.truncated else None,
             duration_ms=0,
         )
 
     # -- helpers ------------------------------------------------------------
-    def _save_evidence(self, evidence: Evidence) -> Evidence:
+    def _save_evidence(
+        self, evidence: Evidence, *, snapshot: str | None = None,
+        start_byte: int = 0, capture_scope: str = "snippet", complete: bool = False,
+        notes: list[str] | None = None,
+    ) -> Evidence:
         cancel = getattr(self._tool_scope, "cancel", None)
         if cancel is not None and cancel.is_set():
-            # A timed-out worker may still finish in the background; do not let
-            # it append evidence after the runner has moved on.
-            return evidence
-        if self.evidence_sink is None:
-            return evidence
-        return self.evidence_sink(evidence)
+            raise ToolFailure("tool_timeout", "capture cancelled after the tool deadline")
+        try:
+            if snapshot is not None and self.evidence_store is not None:
+                saved = self.evidence_store.add_capture(
+                    evidence, snapshot, start_byte=start_byte, capture_scope=capture_scope,
+                    complete_within_scope=complete, notes=notes,
+                )
+            else:
+                saved = self.evidence_sink(evidence) if self.evidence_sink else evidence
+        except (StoreError, OSError) as exc:
+            raise ToolFailure("archive_failed", "capture was not committed; no recoverable pointer was published; retry after storage is available") from exc
+        records = getattr(self._tool_scope, "evidence", None)
+        if records is not None:
+            records[saved.evidence_id] = saved
+        return saved
+
+    def _capture_data(self, evidence: Evidence) -> dict[str, Any]:
+        windows = select_windows(evidence, [], 16000)
+        if evidence.snapshot_sha256 is not None:
+            windows = [window.model_copy(update={
+                "read_cursor": make_cursor(self.run_id, evidence, (evidence.snapshot_start_byte or 0) + window.start_byte)
+            }) for window in windows]
+        data = {
+            "recoverable": evidence.snapshot_sha256 is not None,
+            "snapshot_sha256": evidence.snapshot_sha256,
+            "snapshot_bytes": evidence.snapshot_bytes,
+            "capture_scope": evidence.capture_scope,
+            "complete_within_scope": evidence.complete_within_scope,
+            "capture_notes": evidence.capture_notes,
+            "evidence_windows": [window.model_dump(mode="json") for window in windows],
+        }
+        if evidence.snapshot_sha256 and evidence.snapshot_start_byte:
+            # A read beginning in the middle of a file must also expose a way
+            # to read its captured prefix, without re-opening the live source.
+            data["snapshot_start_cursor"] = make_cursor(self.run_id, evidence, 0)
+        return data
+
+    def _continuation(self, evidence: Evidence, offset: int) -> dict[str, Any]:
+        if evidence.snapshot_sha256 is None:
+            return {"reason": "capture_unavailable", "next": "re-read the source using the original tool"}
+        return {"tool": "read_evidence", "evidence_id": evidence.evidence_id,
+                "cursor": make_cursor(self.run_id, evidence, offset)}
+
+    def _bound_result(self, result: ToolResult) -> ToolResult:
+        def size(value: ToolResult) -> int:
+            return len(json.dumps(value.model_dump(mode="json"), ensure_ascii=False).encode())
+        if size(result) <= TOOL_RESULT_MAX_BYTES:
+            return result
+        records = getattr(self._tool_scope, "evidence", {})
+        items = [records[eid] for eid in result.evidence_refs if eid in records]
+        if not items:
+            # No archived material means there is no safe offload pointer.
+            raise ToolFailure("result_too_large", "result exceeds 8 KiB and no committed capture can be read back")
+        original = result.data if isinstance(result.data, dict) else {}
+        metadata_keys = {"path", "start_line", "end_line", "total_lines", "sha256",
+                         "line_truncated", "skipped_long_line", "commit", "dirty",
+                         "comments_error", "stale", "stale_reason"}
+        metadata = {key: value for key, value in original.items() if key in metadata_keys}
+        # Metadata, encoded JSON, cursors and all literal fragments share the
+        # same hard result bound. More evidence remains indexed, not displayed.
+        visible = items[:4]
+        body_bytes = 3500
+        while visible:
+            windows = []
+            for item in visible:
+                chosen = select_windows(item, [], max(12, body_bytes // len(visible)))[:1]
+                for window in chosen:
+                    if item.snapshot_sha256:
+                        window = window.model_copy(update={"read_cursor": make_cursor(
+                            self.run_id, item, (item.snapshot_start_byte or 0) + window.start_byte)})
+                    windows.append(window)
+            first = visible[0]
+            first_windows = [w for w in windows if w.evidence_id == first.evidence_id]
+            end = (first.snapshot_start_byte or 0) + (first_windows[-1].end_byte if first_windows else 0)
+            more = first.snapshot_bytes is not None and end < first.snapshot_bytes
+            continuation = self._continuation(first, end if more else (first.snapshot_start_byte or 0))
+            candidate = ToolResult(
+                status=ToolStatus.OK,
+                data={**metadata, "structured_result_omitted": True,
+                      "unshown_fields_remain_unknown": True,
+                      "capture_scope": first.capture_scope,
+                      "complete_within_scope": first.complete_within_scope,
+                      "capture_notes": first.capture_notes,
+                      "snapshot_sha256": first.snapshot_sha256,
+                      "snapshot_bytes": first.snapshot_bytes,
+                      "recoverable": first.snapshot_sha256 is not None,
+                      "next_cursor": continuation.get("cursor"),
+                      "cursor_evidence_id": first.evidence_id,
+                      **({"snapshot_start_cursor": make_cursor(self.run_id, first, 0)}
+                         if first.snapshot_sha256 and first.snapshot_start_byte else {}),
+                      "evidence_windows": [w.model_dump(mode="json") for w in windows],
+                      "unshown_evidence_ids": [eid for eid in result.evidence_refs
+                                               if eid not in {w.evidence_id for w in windows}]},
+                evidence_refs=result.evidence_refs, truncated=True,
+                continuation={**(result.continuation or {}), **continuation,
+                              "reason": (result.continuation or {}).get("reason", "result_budget")},
+                duration_ms=result.duration_ms,
+            )
+            if size(candidate) <= TOOL_RESULT_MAX_BYTES:
+                return candidate
+            body_bytes = body_bytes * 3 // 4
+            if body_bytes < 40:
+                visible = visible[:-1]
+                body_bytes = 2000
+        raise ToolFailure("result_too_large", "capture metadata does not fit the 8 KiB tool result limit")
 
     def _trace(
         self,

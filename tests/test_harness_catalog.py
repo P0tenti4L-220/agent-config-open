@@ -114,7 +114,8 @@ def test_parent_manual_split_does_not_inherit_routing_pass(tmp_path: Path) -> No
 
 def test_acceptance_commands_are_not_model_tools(tmp_path: Path) -> None:
     names = {spec.name for spec in tool_specs()}
-    assert len(TOOL_NAMES) == 6
+    assert len(TOOL_NAMES) == 7
+    assert "read_evidence" in TOOL_NAMES
     assert names == set(TOOL_NAMES)
     for forbidden in ("accept", "doctor", "record-review", "shell", "bash"):
         assert forbidden not in names

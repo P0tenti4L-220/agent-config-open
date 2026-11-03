@@ -17,8 +17,8 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict
 
 POLICY_VERSION = "policy-v1"
-PROMPT_VERSION = "prompt-v2"
-TOOL_SCHEMA_VERSION = "tools-v1"
+PROMPT_VERSION = "prompt-v3"
+TOOL_SCHEMA_VERSION = "tools-v2"
 PLAYBOOK_CATALOG_VERSION = "playbooks-v1"
 
 

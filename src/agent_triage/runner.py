@@ -45,6 +45,7 @@ from .errors import InputError, ModelError, ModelOutputError, RunInterrupted, St
 from .ingest import fingerprint
 from .models import FinalResponse, ModelClient, ModelContext, RemainingBudget, ToolRequests
 from .request_views import RequestViewStore, load_request_views, verify_display_records
+from .state_projection import arguments_hash
 from .render import (
     checks_to_json,
     render_handoff,
@@ -62,7 +63,7 @@ from .store import (
     hash_file,
     utcnow,
 )
-from .tools import GithubBackend, ToolExecutor, Workspace, tool_specs
+from .tools import GithubBackend, ToolExecutor, Workspace, redact_arguments, tool_specs
 
 
 @dataclass
@@ -172,6 +173,7 @@ class Runner:
             run_id=store.run_id,
             policy=self.hooks,
             evidence_lookup=self._evidence_exists,
+            evidence_store=self.evidence,
         )
         if checkpoint is not None:
             self._verify_resume(checkpoint)
@@ -275,6 +277,7 @@ class Runner:
                 system=context.system,
                 messages=context.messages,
                 evidence=self.evidence.all(),
+                windows=context.packet.evidence_windows,
             )
             started = utcnow()
             started_monotonic = self.clock()
@@ -590,7 +593,7 @@ class Runner:
         self.store.write_json(
             "display.json",
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "displayed": [item.model_dump(mode="json") for item in self.displayed],
                 "request_views": [
                     {
@@ -615,11 +618,15 @@ class Runner:
         elif isinstance(call.arguments.get("query"), str):
             action += f":{call.arguments['query'][:120]}"
         entry = AttemptLedgerEntry(
+            schema_version=2,
             turn=self.turn,
             action=action[:500],
             status=result.status.value + (f":{result.error_code}" if result.error_code else ""),
             new_information=bool(new_evidence),
             detail=(result.error_code or "")[:500] or None,
+            call_id=call.call_id,
+            arguments_sha256=arguments_hash(redact_arguments(call.arguments)),
+            source_ref=f"trace.jsonl:{len(self.trace)}",
         )
         ledger = [*self.investigation.attempt_ledger, entry][-100:]
         required = list(self.investigation.required_evidence_ids)
@@ -628,7 +635,7 @@ class Runner:
                 required.append(evidence_id)
         needed = list(self.investigation.needed_materials)
         path = call.arguments.get("path")
-        if isinstance(path, str) and path in needed:
+        if result.status.value == "ok" and isinstance(path, str) and path in needed:
             needed.remove(path)
         if result.error_code:
             next_reason = f"recover from {result.error_code} without repeating an identical call"
@@ -648,7 +655,7 @@ class Runner:
         )
 
     def _update_investigation(self, **changes: Any) -> None:
-        payload = {**self.investigation.model_dump(mode="json"), **changes}
+        payload = {**self.investigation.model_dump(mode="json"), "schema_version": 2, **changes}
         self.investigation = InvestigationState.model_validate(payload)
 
     def _finish_investigation(self, analysis: Analysis) -> InvestigationState:
@@ -1138,6 +1145,11 @@ class Runner:
             *[check.description[:500] for check in analysis.suggested_checks],
         ][:20]
         payload["resume_from"]["next_model_turn"] = self.turn
+        payload["displayed_count"] = len(self.displayed)
+        payload["state_projection"]["not_executed"] = payload["not_executed"]
+        payload["state_projection"]["open_questions"] = [question for hypothesis in analysis.hypotheses
+                                                         for question in hypothesis.open_questions]
+        payload["state_projection"]["suggested_checks"] = [check.model_dump(mode="json") for check in analysis.suggested_checks]
         try:
             return ContextPacket.model_validate(payload)
         except ValidationError as exc:
@@ -1248,19 +1260,9 @@ class Runner:
         return json.dumps(note, ensure_ascii=False)
 
     def _tool_result_content(self, result: Any) -> str:
-        data = json.dumps(result.data, ensure_ascii=False, sort_keys=True)
-        if len(data) > 1200:
-            data = data[:1200] + "...<truncated; body is in evidence by id>"
-        payload = {
-            "status": result.status.value,
-            "error_code": result.error_code,
-            "retryable": result.retryable,
-            "truncated": result.truncated,
-            "continuation": result.continuation,
-            "evidence_refs": result.evidence_refs,
-            "data": data,
-        }
-        return json.dumps(payload, ensure_ascii=False)
+        # The executor already bounds the complete JSON result. A second
+        # character cut would break exact windows, cursors and JSON structure.
+        return json.dumps(result.model_dump(mode="json"), ensure_ascii=False)
 
     def _initial_remote_status(self) -> str:
         if not self.config.mcp.enabled:

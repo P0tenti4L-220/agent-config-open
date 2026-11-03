@@ -6,6 +6,14 @@ An evidence-grounded CLI agent for error triage, context packaging, and handoff.
 
 这是一个 Python 单 Agent 项目：模型在受限工具循环中读取项目材料，区分事实、假设和缺失证据，输出报告、结构化上下文与交接说明。支持无需 API Key 的离线演示，以及 DeepSeek / Anthropic 真实模型。GitHub 历史问题查询是可选的只读扩展。
 
+## 最近更新（2026-11-03）
+
+- **精确证据窗口**：按当前问题选择相关原文，优先保留反证与必要材料；分别记录实际展示范围和遗漏，不把整份文件算作已读。
+- **调查状态保留**：在上下文与交接文件中保留未解决的失败、无新证据的尝试和 `not_run` 检查，减少续接时丢失关键状态。
+- **快照续读**：新增 `read_evidence`，从当前运行已捕获的内容继续读取；游标绑定来源版本、字节范围和 hash，不重新请求远端内容。
+
+实现、版本兼容及捕获范围见[上下文选择与快照续读](docs/context-selection.md)。本轮实际检查见[验证记录](docs/verification.md)；真实模型的配对质量、成本和耗时实验为 `not_run`。
+
 ## 一分钟运行演示
 
 需要 Python 3.11+ 和 Git。演示使用合成项目及预设模型响应，不联网、不需要 Key。
@@ -79,7 +87,7 @@ flowchart LR
     F --> G[报告 / 上下文 / 交接]
 ```
 
-模型只能调用六个工具：`read_file`、`search_text`、`git_status`、`search_lessons`、`github_search_issues`、`github_read_issue`。项目路径、工具参数、模型请求次数、工具次数和运行时间由程序限制。恢复运行保留累计预算。
+模型只能调用七个工具：`read_file`、`search_text`、`git_status`、`search_lessons`、`github_search_issues`、`github_read_issue`、`read_evidence`。最后一个工具只读取当前运行已经登记的快照；它不接受任意路径或 URL。项目路径、工具参数、模型请求次数、工具次数和运行时间由程序限制。恢复运行保留累计预算。
 
 这是诊断助手：不自动修复业务源码、不执行任意 shell，也不发布 issue。建议的检查保留 `not_run`；模型自评不能代替外部复核。
 

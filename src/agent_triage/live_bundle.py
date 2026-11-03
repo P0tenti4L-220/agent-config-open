@@ -49,7 +49,7 @@ _FILE_NAMES = {
     "review-status.json",
     "evidence/index.json",
 }
-_DIR_PREFIXES = ("evidence/snippets/", "request-views/")
+_DIR_PREFIXES = ("evidence/snippets/", "evidence/objects/", "request-views/")
 
 
 class BundleFile(StrictModel):

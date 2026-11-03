@@ -73,24 +73,28 @@ def _analysis_text() -> str:
     )
 
 
-def test_tool_use_round_trip_and_request_shape() -> None:
+@pytest.mark.parametrize("tool_name, arguments", [
+    ("read_file", {"path": "src/app.py"}),
+    ("read_evidence", {"evidence_id": "ev-0123456789ab", "cursor": "bound-cursor", "max_bytes": 1024}),
+])
+def test_tool_use_round_trip_and_request_shape(tool_name: str, arguments: dict) -> None:
     body = _message(
         [
             {"type": "text", "text": "I will read the file."},
             {
                 "type": "tool_use",
                 "id": "toolu_1",
-                "name": "read_file",
-                "input": {"path": "src/app.py"},
+                "name": tool_name,
+                "input": arguments,
             },
         ]
     )
     model, seen = _model(lambda request: httpx.Response(200, json=body))
     response = model.next(_context(), tool_specs(), RemainingBudget(2, 3, 10.0))
     assert isinstance(response, ToolRequests)
-    assert [call.name for call in response.calls] == ["read_file"]
+    assert [call.name for call in response.calls] == [tool_name]
     assert response.calls[0].call_id == "toolu_1"
-    assert response.calls[0].arguments == {"path": "src/app.py"}
+    assert response.calls[0].arguments == arguments
     assert response.assistant_content[0]["type"] == "text"
     assert response.usage == {"input_tokens": 12, "output_tokens": 7}
     request = seen[0]
