@@ -436,7 +436,7 @@ class RunStore:
     # -- artifacts ----------------------------------------------------------
     def _artifact_path(self, name: str) -> Path:
         if name not in ARTIFACT_NAMES and not name.startswith(
-            ("evidence/snippets/", "evidence/outcomes/")
+            ("evidence/snippets/", "evidence/objects/", "evidence/outcomes/")
         ):
             raise StoreError(f"artifact name is not allowed: {name}")
         path = self.dir / name
@@ -574,7 +574,7 @@ class RunLock:
 
 
 class EvidenceIndex(StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 2
     evidence: list[Evidence] = Field(default_factory=list, max_length=2000)
 
 
@@ -609,9 +609,63 @@ class EvidenceStore:
             return existing
         snippet_path = self.run.dir / "evidence" / "snippets" / f"{evidence.evidence_id}.txt"
         atomic_write_text(snippet_path, evidence.snippet)
-        current[evidence.evidence_id] = evidence
-        self._save()
+        # Publish the index last. A failed index write must not leave a cached
+        # reference that another tool could mistake for a committed capture.
+        updated = {**current, evidence.evidence_id: evidence}
+        atomic_write_json(self.path, EvidenceIndex(evidence=list(updated.values())).model_dump(mode="json"))
+        self._cache = updated
         return evidence
+
+    def add_capture(
+        self, evidence: Evidence, text: str, *, start_byte: int,
+        capture_scope: str, complete_within_scope: bool,
+        notes: list[str] | None = None,
+    ) -> Evidence:
+        raw = text.encode("utf-8")
+        if len(raw) > 8 * 1024 * 1024:
+            raise StoreError("capture exceeds the 8 MiB archive limit")
+        end = start_byte + len(evidence.snippet.encode("utf-8"))
+        if raw[start_byte:end] != evidence.snippet.encode("utf-8"):
+            raise StoreError("evidence snippet is not an exact slice of its capture")
+        digest = hashlib.sha256(raw).hexdigest()
+        path = self.run._artifact_path(f"evidence/objects/{digest}.txt")
+        if path.exists():
+            if path.read_bytes() != raw:
+                raise StoreError("existing capture object is corrupt")
+        else:
+            atomic_write_text(path, text)
+        captured = Evidence.model_validate({
+            **evidence.model_dump(mode="json"), "schema_version": 2,
+            "snapshot_sha256": digest, "snapshot_bytes": len(raw),
+            "snapshot_start_byte": start_byte, "snapshot_end_byte": end,
+            "snapshot_line_start": (evidence.line_start - raw[:start_byte].count(b"\n")) if evidence.line_start else None,
+            "capture_scope": capture_scope, "complete_within_scope": complete_within_scope,
+            "capture_notes": [note[:500] for note in (notes or [])],
+        })
+        return self.add(captured)
+
+    def capture_text(self, evidence_id: str) -> str:
+        item = self.require(evidence_id)
+        if item.snapshot_sha256 is None:
+            # Legacy records contain only this snippet. Never re-open a live
+            # source to manufacture the missing historical content.
+            return item.snippet
+        path = self.run._artifact_path(f"evidence/objects/{item.snapshot_sha256}.txt")
+        try:
+            if path.stat().st_size != item.snapshot_bytes:
+                raise StoreError("capture object length mismatch")
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise StoreError("capture object is missing or unreadable") from exc
+        if hashlib.sha256(raw).hexdigest() != item.snapshot_sha256:
+            raise StoreError("capture object hash mismatch")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise StoreError("capture object is not UTF-8") from exc
+        if raw[item.snapshot_start_byte:item.snapshot_end_byte] != item.snippet.encode("utf-8"):
+            raise StoreError("capture range does not match the stored snippet")
+        return text
 
     def get(self, evidence_id: str) -> Evidence | None:
         return self._load().get(evidence_id)
@@ -688,6 +742,23 @@ class EvidenceStore:
         updated = self._replace(item, stale=True, stale_reason=reason)
         self._save()
         return updated
+
+    def mark_source_stale(self, source: Evidence, reason: str) -> None:
+        """Publish one version's stale flag for all of its captured ranges."""
+        current = self._load()
+        updated: dict[str, Evidence] = {}
+        changed = False
+        for key, item in current.items():
+            same_source = (item.kind, item.path, item.url, item.sha256) == (
+                source.kind, source.path, source.url, source.sha256)
+            if same_source and (not item.stale or item.stale_reason != reason):
+                item = Evidence.model_validate({**item.model_dump(mode="json"),
+                                                "stale": True, "stale_reason": reason})
+                changed = True
+            updated[key] = item
+        if changed:
+            atomic_write_json(self.path, EvidenceIndex(evidence=list(updated.values())).model_dump(mode="json"))
+            self._cache = updated
 
     def _replace(self, item: Evidence, **changes: Any) -> Evidence:
         updated = Evidence.model_validate({**item.model_dump(mode="json"), **changes})

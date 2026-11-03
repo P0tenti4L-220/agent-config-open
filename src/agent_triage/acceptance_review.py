@@ -562,6 +562,20 @@ def _copy_case_bundle(run_dir: Path, bundle: Path, reference: Path) -> list[str]
         (bundle / "evidence").mkdir(parents=True)
         shutil.copyfile(index, bundle / "evidence" / "index.json")
         copied.append("evidence/index.json")
+        from .store import EvidenceIndex
+
+        registered = EvidenceIndex.model_validate(read_json(index)).evidence
+        for digest in sorted({item.snapshot_sha256 for item in registered if item.snapshot_sha256}):
+            source = run_dir / "evidence/objects" / f"{digest}.txt"
+            _relative_under(source, run_dir)
+            if source.parent.is_symlink() or source.is_symlink() or not source.is_file():
+                raise ValidationFailure("registered capture is missing or symbolic in the review bundle")
+            if _sha256_file(source) != digest:
+                raise ValidationFailure("registered capture hash does not match its object")
+            destination = bundle / "evidence/objects" / source.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+            copied.append(f"evidence/objects/{source.name}")
     views = run_dir / "request-views"
     if views.is_dir():
         (bundle / "request-views").mkdir(parents=True)

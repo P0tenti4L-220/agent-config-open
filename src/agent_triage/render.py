@@ -295,9 +295,15 @@ def render_handoff(
     lines.extend(["", "## 已尝试动作", ""])
     if packet.failed_attempts:
         for attempt in packet.failed_attempts:
-            lines.append(f"- {_safe_text(attempt.action)}：`{attempt.status}`（{_safe_text(attempt.reason or '无原因')}）")
+            lines.append(f"- {_safe_text(attempt.action)}：`{attempt.status}`（{_safe_text(attempt.reason or '无原因')}）；"
+                         f"来源：`{attempt.source_ref or 'legacy: 未记录'}`；重试条件：{_safe_text(attempt.retry_condition)}")
     else:
         lines.append("- 无失败工具调用")
+    no_progress = packet.state_projection.get("no_progress_attempts", [])
+    if no_progress:
+        lines.append(f"- 成功返回但无新证据：{len(no_progress)} 次；仍未解决，明细见 `context.json:state_projection.no_progress_attempts`。")
+        for attempt in no_progress[:10]:
+            lines.append(f"  - `{attempt.get('call_id')}`：{_safe_text(attempt['action'])}；来源：`{attempt['source_ref']}`")
     lines.extend(["", "## 未执行项", ""])
     lines.extend([f"- {_safe_text(item)}" for item in packet.not_executed] or ["- 无"])
     if analysis and analysis.suggested_checks:
@@ -311,6 +317,8 @@ def render_handoff(
         for omission in omissions[:10]:
             affected = "、".join(omission.affected_claim_ids) or "（尚未映射到主张）"
             lines.append(f"- 遗漏 {_safe_text(omission.request)}：{_safe_text(omission.reason)}；影响：{affected}")
+        if len(omissions) > 10:
+            lines.append(f"- 另有 {len(omissions) - 10} 条未展开，见 `investigation.json:omissions`。")
     else:
         lines.append("- 没有记录关键材料遗漏。")
     support = (
@@ -344,7 +352,8 @@ def render_handoff(
             f"agent-triage resume --run-id {packet.run_id} --output <OUTPUT_ROOT>",
             "```",
             "",
-            "证据正文用 evidence ID 回查 `evidence/index.json` 与 `evidence/snippets/`。",
+            "证据正文用 evidence ID 回查 `evidence/index.json` 与 `evidence/snippets/`；"
+            "已捕获快照位于 `evidence/objects/`。`read_evidence` 只续读同一快照，未捕获部分仍未知。",
             "",
         ]
     )

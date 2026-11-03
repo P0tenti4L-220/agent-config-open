@@ -28,12 +28,14 @@ from .contracts import (
     DisplaySource,
     Evidence,
     EvidenceId,
+    EvidenceWindow,
     Sha256,
     StrictInt,
     StrictModel,
 )
 from .errors import InputError, ValidationFailure
 from .store import atomic_write_json, read_json, utcnow
+from .windows import verify_window
 
 REQUEST_ID_RE = re.compile(r"^req-[0-9]{6}$")
 MAX_FRAGMENT_CHARS = 8000
@@ -52,6 +54,7 @@ class EvidenceView(StrictModel):
     visible_chars: StrictInt = Field(ge=0, le=1_000_000)
     visible_sha256: Sha256
     fragment: str = Field(min_length=1, max_length=MAX_FRAGMENT_CHARS)
+    window: EvidenceWindow | None = None
 
     @model_validator(mode="after")
     def _hash_matches_fragment(self) -> "EvidenceView":
@@ -59,11 +62,15 @@ class EvidenceView(StrictModel):
             raise ValueError("visible_chars must equal the stored fragment length")
         if self.visible_sha256 != _sha256_text(self.fragment):
             raise ValueError("visible_sha256 must hash the stored fragment")
+        if self.window is not None:
+            if (self.window.evidence_id != self.evidence_id or self.window.source_sha256 != self.source_sha256
+                    or self.window.text != self.fragment):
+                raise ValueError("exact window must match its evidence view")
         return self
 
     def to_displayed(self, *, turn: int, request_id: str) -> DisplayedEvidence:
         return DisplayedEvidence(
-            schema_version=2,
+            schema_version=3 if self.window is not None else 2,
             evidence_id=self.evidence_id,
             turn=turn,
             source=self.source,
@@ -72,11 +79,14 @@ class EvidenceView(StrictModel):
             visible_sha256=self.visible_sha256,
             request_id=request_id,
             source_sha256=self.source_sha256,
+            window=self.window,
+            line_start=self.window.line_start if self.window else None,
+            line_end=self.window.line_end if self.window else None,
         )
 
 
 class RequestView(StrictModel):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[2, 3] = 3
     request_id: str
     run_id: str
     turn: StrictInt = Field(ge=0)
@@ -116,6 +126,7 @@ class RequestViewStore:
         system: str,
         messages: list[dict[str, Any]],
         evidence: list[Evidence],
+        windows: list[EvidenceWindow] | None = None,
     ) -> RequestView:
         self.directory.mkdir(parents=True, exist_ok=True)
         existing = [
@@ -138,7 +149,7 @@ class RequestViewStore:
             snapshot_messages = [
                 {"role": "user", "content": [{"type": "text", "text": "[snapshot omitted: payload exceeded bounded snapshot size]"}]}
             ]
-        views = derive_evidence_views(evidence, system=system, messages=messages)
+        views = derive_evidence_views(evidence, system=system, messages=messages, windows=windows)
         view = RequestView(
             request_id=request_id,
             run_id=run_id,
@@ -218,13 +229,42 @@ def derive_evidence_views(
     *,
     system: str,
     messages: list[dict[str, Any]],
+    windows: list[EvidenceWindow] | None = None,
 ) -> list[EvidenceView]:
     """Return only evidence bodies/fragments present in the submitted payload."""
     message_leaves = _leaf_strings(messages)
     leaves = [system, *message_leaves]
     blob = "\n".join(leaf for leaf in leaves if leaf)
     views: list[EvidenceView] = []
+    evidence = list(evidence)
+    known = {item.evidence_id: item for item in evidence}
+    explicit = [*(windows or []), *_payload_windows(messages)]
+    explicit_ids = {window.evidence_id for window in explicit}
+    seen: set[tuple[str, str]] = set()
+    for window in explicit:
+        item = known.get(window.evidence_id)
+        if item is None or not verify_window(item, window):
+            continue
+        # Exact contiguous text, not a sequence of distant matching lines.
+        source = (DisplaySource.CONTEXT if window.text in system else DisplaySource.TOOL_RESULT)
+        present = window.text in system or any(window.text in leaf for leaf in message_leaves)
+        key = (window.window_id, source.value)
+        if not present or key in seen:
+            continue
+        seen.add(key)
+        views.append(EvidenceView(
+            evidence_id=item.evidence_id, source_sha256=item.sha256, source=source,
+            mode="full" if window.start_byte == 0 and window.end_byte == len(item.snippet.encode()) else "truncated",
+            visible_chars=len(window.text), visible_sha256=window.text_sha256,
+            fragment=window.text, window=window,
+        ))
     for item in evidence:
+        if item.evidence_id in explicit_ids:
+            continue
+        if item.schema_version >= 2:
+            # New captures require an explicit exact window. Heuristic v2
+            # matching remains solely for historical snippet-only evidence.
+            continue
         match = _match_evidence(item, system=system, blob=blob, leaves=leaves)
         if match is None:
             continue
@@ -284,6 +324,9 @@ def verify_display_records(
                 f"request {record.request_id} for {record.evidence_id} did not receive a response"
             )
             continue
+        if record.schema_version >= 3 and view.schema_version < 3:
+            problems.append(f"window display requires request view v3: {record.request_id}")
+            continue
         if not view.payload_complete:
             problems.append(
                 f"request {record.request_id} has an incomplete payload snapshot; "
@@ -309,6 +352,7 @@ def verify_display_records(
             and candidate.source_sha256 == record.source_sha256
             and candidate.source == record.source
             and candidate.mode == record.mode
+            and candidate.window == record.window
         ]
         if not matches:
             problems.append(
@@ -320,7 +364,9 @@ def verify_display_records(
             problems.append(f"display width changed for {record.evidence_id}")
         if candidate.visible_sha256 != _sha256_text(candidate.fragment):
             problems.append(f"display fragment hash cannot be recomputed for {record.evidence_id}")
-        if view.payload_complete and not _fragment_in_payload(candidate.fragment, view):
+        if record.schema_version >= 3 and (candidate.window is None or not verify_window(item, candidate.window)):
+            problems.append(f"display window range or source cannot be verified for {record.evidence_id}")
+        if view.payload_complete and not _fragment_in_payload(candidate.fragment, view, exact=candidate.window is not None):
             problems.append(
                 f"display fragment for {record.evidence_id} is not present in request {record.request_id}"
             )
@@ -333,9 +379,36 @@ def _payload_sha256(view: RequestView) -> str:
     return _sha256_text(text)
 
 
-def _fragment_in_payload(fragment: str, view: RequestView) -> bool:
+def _fragment_in_payload(fragment: str, view: RequestView, *, exact: bool = False) -> bool:
+    if exact:
+        return fragment in view.system or any(fragment in leaf for leaf in _leaf_strings(view.messages))
     blob = "\n".join([view.system, *_leaf_strings(view.messages)])
     return _fragment_present(fragment, blob)
+
+
+def _payload_windows(value: Any, depth: int = 0) -> list[EvidenceWindow]:
+    if depth > 12:
+        return []
+    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return []
+    found: list[EvidenceWindow] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "evidence_windows" and isinstance(child, list):
+                for raw in child:
+                    try:
+                        found.append(EvidenceWindow.model_validate(raw))
+                    except ValidationError:
+                        continue
+            else:
+                found.extend(_payload_windows(child, depth + 1))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_payload_windows(child, depth + 1))
+    return found
 
 
 def _fragment_present(fragment: str, blob: str) -> bool:
@@ -425,7 +498,7 @@ def _bounded(text: str) -> str:
 
 def _leaf_strings(value: Any, *, depth: int = 0) -> list[str]:
     """Flatten strings, following JSON-in-string content used by tool results."""
-    if depth > 5:
+    if depth > 12:
         return []
     leaves: list[str] = []
     if isinstance(value, str):

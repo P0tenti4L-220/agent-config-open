@@ -15,13 +15,11 @@ from .contracts import (
     ContextPacket,
     CountMode,
     DisplayedEvidence,
-    DisplaySource,
     Evidence,
     EvidenceIndexEntry,
     EvidenceKind,
+    EvidenceWindow,
     Fact,
-    FailedAttempt,
-    Hypothesis,
     InvestigationState,
     LayerBudget,
     LessonSummary,
@@ -35,10 +33,11 @@ from .contracts import (
 from .models import ModelContext
 from .playbooks import Playbook, playbook_hash as _playbook_hash, render_playbook
 from .policy import PROMPT_VERSION, policy_prompt_text
-from .store import BudgetState, LessonStore
-from .tools import tool_definitions_text, truncate_utf8
-
-MAX_SYSTEM_CHARS = 40_000
+from .store import BudgetState
+from .state_projection import NOT_EXECUTED, failed_attempts, project_state, render_state
+from .tools import truncate_utf8
+from .windows import query_terms, relevance, render_window, select_windows
+from .cursors import make_cursor
 
 
 def estimate_tokens(text: str) -> int:
@@ -78,6 +77,9 @@ Rules:
   that no related issue exists.
 - Work within the remaining budget. Do not repeat an identical tool call when
   it produced no new evidence.
+- Evidence windows are exact partial slices. Unshown ranges stay unknown;
+  use read_evidence with the returned cursor for captured content. A pointer
+  alone is not a read, and deterministic state summaries never upgrade not_run.
 
 When you have enough evidence, stop calling tools and output only one JSON
 object (no prose, no markdown fences) with this shape:
@@ -123,6 +125,7 @@ class ContextBuilder:
         selections: list[SelectionRecord] = []
         displayed: list[DisplayedEvidence] = []
         omissions: list[OmissionImpact] = []
+        windows: list[EvidenceWindow] = []
         layer_used = {
             "constraints": 0,
             "tool_definitions": 0,
@@ -139,13 +142,14 @@ class ContextBuilder:
                 "\nThis is the final allowed model request. Do not call tools. "
                 "Submit the final JSON object now, or a partial/failed analysis if evidence is insufficient."
             )
+        full_constraints = constraints
         constraints = truncate_utf8(constraints, self.limits.constraints_tokens * 3)
         layer_used["constraints"] = estimate_tokens(constraints)
         selections.append(
             SelectionRecord(
                 layer="constraints",
                 source="system_prompt",
-                decision=SelectionDecision.INCLUDED,
+                decision=SelectionDecision.INCLUDED if constraints == full_constraints else SelectionDecision.TRUNCATED,
                 reason="fixed analysis and safety constraints",
                 tokens=layer_used["constraints"],
                 count_mode=CountMode.ESTIMATED,
@@ -162,11 +166,11 @@ class ContextBuilder:
         tool_tokens = estimate_tokens(tool_text)
         if tool_tokens > self.limits.tool_definitions_tokens:
             # Tool schemas must not be cut in half; record the overflow instead.
-            decision = SelectionDecision.TRUNCATED
-            reason = "tool schemas exceed the layer limit; all six remain visible to avoid malformed calls"
+            decision = SelectionDecision.INCLUDED
+            reason = "tool schemas exceed the layer limit; complete registered schemas remain visible"
         else:
             decision = SelectionDecision.INCLUDED
-            reason = "all six restricted tools, no MCP-internal tools"
+            reason = f"all {len(tool_specs)} registered restricted tools, no MCP-internal tools"
         layer_used["tool_definitions"] = tool_tokens
         selections.append(
             SelectionRecord(
@@ -187,7 +191,7 @@ class ContextBuilder:
             ("policy", policy_prompt_text(), 1400),
             ("playbook", render_playbook(playbook, max_chars=2200) if playbook else "", 2200),
         ]
-        task_text, task_truncated = self._fit_blocks(blocks, self.limits.task_facts_tokens * 3)
+        task_text, task_truncated, fitted_blocks = self._fit_blocks(blocks, self.limits.task_facts_tokens * 3)
         layer_used["task_facts"] = estimate_tokens(task_text)
         selections.append(
             SelectionRecord(
@@ -202,21 +206,44 @@ class ContextBuilder:
         for name, chunk, _cap in blocks:
             if not chunk:
                 continue
+            rendered = fitted_blocks.get(name, "")
             selections.append(
                 SelectionRecord(
                     layer="task_facts",
                     source=name,
-                    decision=SelectionDecision.INCLUDED,
+                    decision=(SelectionDecision.INCLUDED if rendered == chunk else
+                              SelectionDecision.TRUNCATED if rendered else SelectionDecision.OMITTED),
                     reason={
                         "investigation": "active question and necessary material",
                         "task": "goal, symptom, paths and confirmed observations",
                         "policy": "stable policy summary with rule ids",
                         "playbook": "the single routed investigation playbook",
                     }[name],
-                    tokens=estimate_tokens(chunk),
+                    tokens=estimate_tokens(rendered),
                     count_mode=CountMode.ESTIMATED,
                 )
             )
+
+        # Reserve critical state before complete protocol pairs. It cannot be
+        # silently lost to a final string truncation.
+        projection = project_state(investigation=investigation, trace=trace,
+                                   budget_state=budget_state, is_final_turn=is_final_turn,
+                                   goal=event.goal, versions=self.versions)
+        base_protocol_tokens = estimate_tokens(json.dumps(self._base_protocol(event), ensure_ascii=False))
+        working_text, state_decisions = render_state(
+            projection, self.limits.working_state_tokens - base_protocol_tokens, estimate_tokens,
+        )
+        protocol_messages, protocol_tokens = self._protocol(
+            conversation, event, selections,
+            working_limit_tokens=self.limits.working_state_tokens - estimate_tokens(working_text),
+        )
+        for source, included, tokens in state_decisions:
+            selections.append(SelectionRecord(
+                layer="working_state", source=source[:500],
+                decision=SelectionDecision.INCLUDED if included else SelectionDecision.OMITTED,
+                reason="sourced state row" if included else "details remain at the named state source; count retained",
+                tokens=tokens, count_mode=CountMode.ESTIMATED,
+            ))
 
         # 4. Current evidence ----------------------------------------------------
         evidence_text, evidence_facts = self._evidence_layer(
@@ -225,26 +252,20 @@ class ContextBuilder:
             layer_used,
             event,
             investigation=investigation,
-            displayed=displayed,
             omissions=omissions,
-            turn=turn,
+            windows=windows,
+            protocol_messages=protocol_messages,
+            run_id=run_id,
         )
+        prior = projection["omissions"]
+        keys = {(row.get("evidence_id"), row["reason"]) for row in prior}
+        projection["omissions"] = [*prior, *[row.model_dump(mode="json") for row in omissions
+                                            if (row.evidence_id, row.reason) not in keys]]
 
         # 5. History (local lessons) --------------------------------------------
         history_text = self._history_text(lessons, selections, layer_used)
 
         # 6. Working state + protocol -------------------------------------------
-        working_text = self._working_state(trace, budget_state, is_final_turn)
-        protocol_messages, protocol_tokens = self._protocol(
-            conversation,
-            event,
-            selections,
-            working_limit_tokens=self.limits.working_state_tokens,
-        )
-        working_text = truncate_utf8(
-            working_text,
-            max(0, (self.limits.working_state_tokens - protocol_tokens) * 3),
-        )
         working_tokens = estimate_tokens(working_text) + protocol_tokens
         layer_used["working_state"] = working_tokens
         selections.append(
@@ -269,13 +290,17 @@ class ContextBuilder:
             )
         system = self._compose_system(
             constraints=constraints,
-            tool_text=tool_text,
             task_text=task_text,
             evidence_text=evidence_text,
             history_text=history_text,
             working_text=working_text,
         )
-        system = truncate_utf8(system, MAX_SYSTEM_CHARS)
+        # Count the actual rendered envelope, including headings/JSON escaping.
+        total_used = (estimate_tokens(system) + estimate_tokens(json.dumps(protocol_messages, ensure_ascii=False))
+                      + tool_tokens)
+        if total_used > self.limits.total_input_tokens:
+            raise ValidationFailure("rendered context exceeds the total input budget",
+                                    detail=f"{total_used} estimated tokens; limit {self.limits.total_input_tokens}")
         packet = ContextPacket(
             run_id=run_id,
             event_id=event.event_id,
@@ -283,11 +308,8 @@ class ContextBuilder:
             goal=event.goal,
             facts=evidence_facts,
             hypotheses=[],
-            failed_attempts=self._failed_attempts(trace),
-            not_executed=[
-                "no test, reproduction or fix has been executed by this agent",
-                "suggested checks remain not_run until a human records an outcome",
-            ],
+            failed_attempts=failed_attempts(trace, investigation.active_question if investigation else event.symptom),
+            not_executed=list(NOT_EXECUTED),
             resume_from=RunPosition(
                 run_id=run_id,
                 next_model_turn=turn,
@@ -325,13 +347,15 @@ class ContextBuilder:
             playbook_version=playbook.version if playbook else None,
             playbook_hash=_playbook_hash(playbook) if playbook else None,
             displayed_count=len(displayed),
+            evidence_windows=windows,
+            state_projection=projection,
             generated_at=datetime.now(timezone.utc),
         )
         return ModelContext(
             system=system,
             messages=protocol_messages,
             packet=packet,
-            input_tokens=sum(layer_used.values()),
+            input_tokens=total_used,
             count_mode=CountMode.ESTIMATED,
             is_final_turn=is_final_turn,
             displayed=displayed,
@@ -374,27 +398,28 @@ class ContextBuilder:
         return facts[:20]
 
     def _fit_blocks(
-        self,
-        blocks: list[tuple[str, str, int]],
-        budget_bytes: int,
-    ) -> tuple[str, bool]:
+        self, blocks: list[tuple[str, str, int]], budget_bytes: int,
+    ) -> tuple[str, bool, dict[str, str]]:
         parts: list[str] = []
-        remaining = budget_bytes
+        fitted: dict[str, str] = {}
         truncated = False
         for name, text, cap in blocks:
             if not text:
                 continue
-            allowed = min(cap, remaining)
-            if allowed <= 0:
+            prefix = "" if name == "task" else name.upper() + ":\n"
+            separator = "\n\n" if parts else ""
+            remaining = budget_bytes - len(("\n\n".join(parts) + separator + prefix).encode())
+            chunk = truncate_utf8(text, max(0, min(cap, remaining)))
+            if chunk != text:
                 truncated = True
-                continue
-            chunk = truncate_utf8(text, allowed)
-            if len(chunk.encode("utf-8")) < len(text.encode("utf-8")):
-                truncated = True
-                chunk += "\n[block truncated for context budget]"
-            parts.append(chunk if name == "task" else f"{name.upper()}:\n{chunk}")
-            remaining = max(0, remaining - len(chunk.encode("utf-8")))
-        return "\n\n".join(parts), truncated
+                marker = "\n[block truncated for context budget]"
+                chunk = truncate_utf8(text, max(0, min(cap, remaining) - len(marker.encode())))
+                if chunk:
+                    chunk += marker
+            if chunk:
+                parts.append(prefix + chunk)
+                fitted[name] = chunk
+        return "\n\n".join(parts), truncated, fitted
 
     def _investigation_text(self, investigation: InvestigationState | None) -> str:
         if investigation is None:
@@ -429,153 +454,135 @@ class ContextBuilder:
         return "\n".join(lines)
 
     def _evidence_layer(
-        self,
-        evidence: list[Evidence],
-        selections: list[SelectionRecord],
-        layer_used: dict[str, int],
-        event: Any,
-        *,
+        self, evidence: list[Evidence], selections: list[SelectionRecord],
+        layer_used: dict[str, int], event: Any, *,
         investigation: InvestigationState | None,
-        displayed: list[DisplayedEvidence],
-        omissions: list[OmissionImpact],
-        turn: int,
+        omissions: list[OmissionImpact], windows: list[EvidenceWindow],
+        protocol_messages: list[dict[str, Any]],
+        run_id: str,
     ) -> tuple[str, list[Fact]]:
-        priority_paths = [*event.error_files, *event.related_files]
-        if investigation is not None:
-            priority_paths.extend(
-                item for item in investigation.needed_materials if "/" in item or "." in item
-            )
-        priority = {path: index for index, path in enumerate(priority_paths)}
+        from .request_views import derive_evidence_views
+
+        priority = set([*event.error_files, *event.related_files])
+        if investigation:
+            priority.update(material for material in investigation.needed_materials if "/" in material or "." in material)
         required = set(investigation.required_evidence_ids if investigation else [])
         counter = set(investigation.counterevidence_ids if investigation else [])
+        terms = query_terms(investigation.active_question if investigation else "",
+                            event.symptom, *(investigation.needed_materials if investigation else []))
 
-        def rank(item: Evidence) -> tuple[int, int, Any]:
-            if item.evidence_id in counter:
-                bucket = 0
-            elif item.evidence_id in required:
-                bucket = 1
-            elif item.path in priority:
-                bucket = 2
-            else:
-                bucket = 3
-            return (bucket, priority.get(item.path or "", 999), item.captured_at)
+        def bucket(item: Evidence) -> int:
+            return (0 if item.evidence_id in counter else 1 if item.evidence_id in required
+                    else 2 if item.path in priority else 3)
 
-        ordered = sorted(evidence, key=rank)
-        limit_tokens = self.limits.current_evidence_tokens
-        remaining = limit_tokens
+        ordered: list[Evidence] = []
+        covered_terms: set[str] = set()
+        covered_sources: set[tuple[Any, ...]] = set()
+        hits = {item.evidence_id: {term for term in terms if relevance(item.snippet, [term])}
+                for item in evidence}
+        for group in range(4):
+            pending_items = [item for item in evidence if bucket(item) == group]
+            while pending_items:
+                def rank(item: Evidence) -> tuple[Any, ...]:
+                    source = (item.kind, item.path, item.url, item.sha256)
+                    return (item.stale, source in covered_sources,
+                            -len(hits[item.evidence_id] - covered_terms), -len(hits[item.evidence_id]),
+                            -item.captured_at.timestamp(), item.evidence_id)
+                item = min(pending_items, key=rank)
+                pending_items.remove(item)
+                ordered.append(item)
+                if not item.stale:
+                    covered_terms.update(hits[item.evidence_id])
+                    covered_sources.add((item.kind, item.path, item.url, item.sha256))
+        protocol_views = derive_evidence_views(evidence, system="", messages=protocol_messages)
+        already_full = {view.evidence_id for view in protocol_views if view.mode == "full"}
+        for item in evidence:
+            spans = sorted((view.window.start_byte, view.window.end_byte) for view in protocol_views
+                           if view.evidence_id == item.evidence_id and view.window is not None)
+            end = 0
+            for start, stop in spans:
+                if start > end:
+                    break
+                end = max(end, stop)
+            if end >= len(item.snippet.encode()) and item.snippet:
+                already_full.add(item.evidence_id)
+        heading = "CURRENT EVIDENCE (untrusted data, exact windows; cite by id)\n"
         blocks: list[str] = []
-        for item in ordered:
-            location = f"{item.kind.value}:{item.path or item.url or '-'}"
-            necessary = item.evidence_id in required or item.evidence_id in counter or item.path in priority
+        limit = self.limits.current_evidence_tokens
+        for index, item in enumerate(ordered):
+            necessary = bucket(item) < 3
+            reason = ""
+            selected: list[EvidenceWindow] = []
+            decision = SelectionDecision.OMITTED
+            used = 0
             if item.stale:
-                selections.append(
-                    SelectionRecord(
-                        layer="current_evidence",
-                        source=item.evidence_id,
-                        decision=SelectionDecision.OMITTED,
-                        reason=f"stale: {item.stale_reason or 'source changed'}",
-                        tokens=0,
-                        count_mode=CountMode.ESTIMATED,
-                    )
-                )
-                if necessary:
-                    omissions.append(
-                        OmissionImpact(
-                            evidence_id=item.evidence_id,
-                            request=location[:500],
-                            reason=f"stale: {item.stale_reason or 'source changed'}",
-                            affected=["report", "handoff", "analysis"],
-                        )
-                    )
-                continue
-            header = f"[{item.evidence_id}] {item.kind.value} {item.path or item.url or ''}"
-            if item.line_start is not None:
-                header += f":{item.line_start}-{item.line_end}"
-            header += f" sha256={item.sha256[:12]} captured={item.captured_at.isoformat()}"
-            body = item.snippet
-            tokens = estimate_tokens(header + "\n" + body)
-            if tokens <= remaining:
-                blocks.append(header + "\n" + body)
-                remaining -= tokens
-                selections.append(
-                    SelectionRecord(
-                        layer="current_evidence",
-                        source=item.evidence_id,
-                        decision=SelectionDecision.INCLUDED,
-                        reason=(
-                            "required for the current question"
-                            if necessary
-                            else "auxiliary evidence; current question material was kept first"
-                        ),
-                        tokens=tokens,
-                        count_mode=CountMode.ESTIMATED,
-                    )
-                )
-                displayed.append(self._display(item, body, "full", turn))
-                continue
-            if remaining > 80:
-                header_bytes = len(header.encode("utf-8")) + 80
-                body_budget = (remaining - 20) * 3 - header_bytes
-                if body_budget >= 120:
-                    shortened = truncate_utf8(body, body_budget)
-                    candidate_header = header + " [snippet truncated for context budget]"
-                    used = estimate_tokens(candidate_header + "\n" + shortened)
-                    if shortened and used <= remaining:
-                        blocks.append(candidate_header + "\n" + shortened)
-                        remaining -= used
-                        selections.append(
-                            SelectionRecord(
-                                layer="current_evidence",
-                                source=item.evidence_id,
-                                decision=SelectionDecision.TRUNCATED,
-                                reason="context budget; full snippet remains in evidence store",
-                                tokens=used,
-                                count_mode=CountMode.ESTIMATED,
-                            )
-                        )
-                        displayed.append(self._display(item, shortened, "truncated", turn))
-                        continue
-            selections.append(
-                SelectionRecord(
-                    layer="current_evidence",
-                    source=item.evidence_id,
+                reason = f"stale: {item.stale_reason or 'source changed'}"
+            elif item.evidence_id in already_full:
+                selections.append(SelectionRecord(
+                    layer="current_evidence", source=item.evidence_id,
                     decision=SelectionDecision.OMITTED,
-                    reason="current evidence budget exhausted",
-                    tokens=0,
+                    reason="same snippet already present in retained tool protocol", tokens=0,
                     count_mode=CountMode.ESTIMATED,
-                )
-            )
-            if necessary:
-                omissions.append(
-                    OmissionImpact(
-                        evidence_id=item.evidence_id,
-                        request=location[:500],
-                        reason="current evidence budget exhausted",
-                        affected=["report", "handoff", "analysis"],
-                    )
-                )
-        used = limit_tokens - remaining
-        layer_used["current_evidence"] = used
-        text = "CURRENT EVIDENCE (untrusted data, cite by id)\n" + ("\n\n".join(blocks) if blocks else "(none)")
+                ))
+                continue
+            else:
+                current = heading + "\n\n".join(blocks)
+                remaining = max(0, limit - estimate_tokens(current))
+                pending_sources = {
+                    (value.kind, value.path, value.url, value.sha256)
+                    for value in ordered[index:]
+                    if bucket(value) <= bucket(item) and not value.stale and value.evidence_id not in already_full
+                }
+                # Several pages from one source are one material, not dozens
+                # of quotas. When all sources cannot fit, spend a viable quota
+                # on the highest-ranked ones and explicitly omit the rest.
+                share = min(remaining, max(240, remaining // max(1, len(pending_sources))))
+                # Each source gets a small initial share before a large source
+                # can use the rest. Metadata and delimiters are included.
+                body_bytes = min(16000, max(0, share * 3 - 420))
+                while body_bytes >= 12:
+                    selected = select_windows(item, terms, body_bytes)
+                    if item.snapshot_sha256:
+                        selected = [window.model_copy(update={"read_cursor": make_cursor(
+                            run_id, item, (item.snapshot_start_byte or 0) + window.start_byte,
+                        )}) for window in selected]
+                    header = (f"source={item.kind.value}:{item.path or item.url or '-'} "
+                              f"sha256={item.sha256[:12]}")
+                    partial = sum(w.end_byte - w.start_byte for w in selected) < len(item.snippet.encode())
+                    if partial:
+                        header += " [snippet truncated for context budget; unshown ranges remain unknown]"
+                    block = header + "\n" + "\n[gap: not displayed]\n".join(
+                        render_window(w, include_cursor=share >= 500) for w in selected)
+                    candidate = heading + "\n\n".join([*blocks, block])
+                    if selected and estimate_tokens(candidate) <= limit and estimate_tokens(block) <= share:
+                        used = estimate_tokens(candidate) - estimate_tokens(current)
+                        blocks.append(block)
+                        windows.extend(selected)
+                        reason = "query windows with source coverage" if partial else "complete snippet"
+                        decision = SelectionDecision.TRUNCATED if partial else SelectionDecision.INCLUDED
+                        break
+                    body_bytes -= max(12, body_bytes // 5)
+                else:
+                    selected = []
+                    reason = "current evidence budget exhausted; pointer retained in context.json:evidence_index"
+            selections.append(SelectionRecord(
+                layer="current_evidence", source=item.evidence_id, decision=decision,
+                reason=reason, tokens=used, count_mode=CountMode.ESTIMATED,
+            ))
+            if necessary and decision != SelectionDecision.INCLUDED:
+                omissions.append(OmissionImpact(
+                    evidence_id=item.evidence_id,
+                    request=f"{item.kind.value}:{item.path or item.url or '-'}"[:500],
+                    reason=reason,
+                    state="stale" if item.stale else "partially_displayed" if selected else "stored_not_displayed",
+                    affected=["report", "handoff", "analysis"],
+                ))
+        text = heading + ("\n\n".join(blocks) if blocks else "(none)")
+        # Zero explicitly disables this optional layer, including its heading.
+        if limit == 0:
+            text = ""
+        layer_used["current_evidence"] = estimate_tokens(text)
         return text, self._evidence_facts(evidence)
-
-    def _display(
-        self,
-        item: Evidence,
-        visible: str,
-        mode: str,
-        turn: int,
-    ) -> DisplayedEvidence:
-        return DisplayedEvidence(
-            evidence_id=item.evidence_id,
-            turn=turn,
-            source=DisplaySource.CONTEXT,
-            mode=mode,  # type: ignore[arg-type]
-            visible_chars=len(visible),
-            visible_sha256=hashlib.sha256(visible.encode("utf-8")).hexdigest(),
-            line_start=item.line_start,
-            line_end=item.line_end,
-        )
 
     def _history_text(
         self,
@@ -636,48 +643,8 @@ class ContextBuilder:
         text = "LOCAL LESSONS (reference, not facts)\n" + ("\n\n".join(blocks) if blocks else "(none matched)")
         return text
 
-    def _working_state(
-        self,
-        trace: list[TraceRecord],
-        budget_state: BudgetState,
-        is_final_turn: bool,
-    ) -> str:
-        tool_records = [record for record in trace if record.kind.value == "tool"]
-        recent = tool_records[-8:]
-        lines = [
-            "WORKING STATE",
-            f"model_requests_used={budget_state.model_requests_used}",
-            f"tool_attempts_used={budget_state.tool_attempts_used}",
-            f"corrections_used={budget_state.corrections_used}",
-            f"final_turn={is_final_turn}",
-            "recent_tool_calls:",
-        ]
-        for record in recent:
-            refs = ",".join(record.evidence_refs) if record.evidence_refs else "-"
-            lines.append(
-                f"- turn={record.turn} call={record.call_id} tool={record.tool_name} "
-                f"status={record.status} error={record.error_code or '-'} evidence={refs}"
-            )
-        failures = [record for record in tool_records if record.status != "ok"]
-        if failures:
-            lines.append("failed_attempts:")
-            for record in failures[-5:]:
-                lines.append(
-                    f"- {record.tool_name} status={record.status} error={record.error_code or 'unknown'}"
-                )
-        if not tool_records:
-            lines.append("no tool calls have completed yet")
-        return "\n".join(lines)
-
-    def _protocol(
-        self,
-        conversation: list[dict[str, Any]],
-        event: Any,
-        selections: list[SelectionRecord],
-        *,
-        working_limit_tokens: int,
-    ) -> tuple[list[dict[str, Any]], int]:
-        base = [
+    def _base_protocol(self, event: Any) -> list[dict[str, Any]]:
+        return [
             {
                 "role": "user",
                 "content": [
@@ -688,6 +655,16 @@ class ContextBuilder:
                 ],
             }
         ]
+
+    def _protocol(
+        self,
+        conversation: list[dict[str, Any]],
+        event: Any,
+        selections: list[SelectionRecord],
+        *,
+        working_limit_tokens: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        base = self._base_protocol(event)
         if not conversation:
             tokens = estimate_tokens(json.dumps(base, ensure_ascii=False))
             selections.append(
@@ -704,13 +681,14 @@ class ContextBuilder:
         # Preserve complete assistant/tool-result pairs.  Drop the oldest pairs
         # first; never emit a tool_result without its tool_use.
         tail = list(conversation)
-        while tail and tail[0].get("role") != "user":
-            tail.pop(0)
         pairs: list[list[dict[str, Any]]] = []
         index = 0
         while index < len(tail):
             if tail[index].get("role") == "assistant" and index + 1 < len(tail) and tail[index + 1].get("role") == "user":
-                pairs.append([tail[index], tail[index + 1]])
+                uses = {b.get("id") for b in tail[index].get("content", []) if isinstance(b, dict) and b.get("type") == "tool_use"}
+                results = {b.get("tool_use_id") for b in tail[index + 1].get("content", []) if isinstance(b, dict) and b.get("type") == "tool_result"}
+                if uses == results:
+                    pairs.append([tail[index], tail[index + 1]])
                 index += 2
             else:
                 index += 1
@@ -731,7 +709,9 @@ class ContextBuilder:
             reason = "protocol history exceeded working-state budget; trace retains call pairs"
         else:
             decision = SelectionDecision.INCLUDED
-            reason = f"kept {len(kept)} complete tool call/result pairs"
+            reason = f"kept {len(kept)} of {len(pairs)} complete tool call/result pairs; full history in trace"
+            if len(kept) < len(pairs):
+                decision = SelectionDecision.TRUNCATED
         selections.append(
             SelectionRecord(
                 layer="protocol",
@@ -744,24 +724,10 @@ class ContextBuilder:
         )
         return messages, tokens
 
-    def _failed_attempts(self, trace: list[TraceRecord]) -> list[FailedAttempt]:
-        attempts: list[FailedAttempt] = []
-        for record in trace:
-            if record.kind.value == "tool" and record.status != "ok":
-                attempts.append(
-                    FailedAttempt(
-                        action=f"{record.tool_name} ({record.call_id})",
-                        status=record.status,
-                        reason=record.error_code or "unknown",
-                    )
-                )
-        return attempts[-10:]
-
     def _compose_system(
         self,
         *,
         constraints: str,
-        tool_text: str,
         task_text: str,
         evidence_text: str,
         history_text: str,
@@ -770,7 +736,7 @@ class ContextBuilder:
         return "\n\n".join(
             [
                 constraints,
-                "TOOLS (only these calls are allowed)\n" + tool_text,
+                "TOOLS: use only the registered restricted tool schemas supplied with this request.",
                 task_text,
                 evidence_text,
                 history_text,

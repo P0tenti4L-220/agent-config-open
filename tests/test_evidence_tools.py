@@ -93,7 +93,9 @@ def test_long_log_continuation_and_limits(tmp_path: Path) -> None:
     first = _execute(executor, "read_file", {"path": "logs/long.log", "start_line": 1, "max_lines": 120})
     assert first.status.value == "ok"
     assert first.truncated is True
-    assert first.continuation == {"start_line": 121}
+    assert first.continuation["start_line"] == 121
+    assert first.continuation["tool"] == "read_evidence"
+    assert first.continuation["cursor"]
     second = _execute(
         executor,
         "read_file",

@@ -192,7 +192,7 @@ class EvidenceKind(StrEnum):
 
 
 class Evidence(StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     evidence_id: EvidenceId
     kind: EvidenceKind
     project_id: ShortStr
@@ -208,6 +208,15 @@ class Evidence(StrictModel):
     commit: str | None = None
     stale: StrictBool = False
     stale_reason: str | None = None
+    snapshot_sha256: Sha256 | None = None
+    snapshot_bytes: StrictInt | None = Field(default=None, ge=0, le=8 * 1024 * 1024)
+    capture_scope: Literal["snippet", "file", "search_match", "github_response", "git_output", "lesson"] = "snippet"
+    complete_within_scope: StrictBool = False
+    capture_notes: list[ShortStr] = Field(default_factory=list, max_length=10)
+    snapshot_start_byte: StrictInt | None = Field(default=None, ge=0)
+    snapshot_end_byte: StrictInt | None = Field(default=None, ge=0)
+    snapshot_line_start: LineNumber | None = None
+    parent_evidence_id: EvidenceId | None = None
 
     @model_validator(mode="after")
     def _source_shape(self) -> "Evidence":
@@ -224,6 +233,15 @@ class Evidence(StrictModel):
             raise ValueError("local file evidence requires a line range")
         if self.stale and not self.stale_reason:
             raise ValueError("stale evidence must state a reason")
+        if self.snapshot_sha256 is not None:
+            if self.schema_version < 2 or self.snapshot_bytes is None:
+                raise ValueError("a snapshot requires evidence v2 and its byte length")
+            if self.snapshot_start_byte is None or self.snapshot_end_byte is None:
+                raise ValueError("a snapshot requires the snippet byte range")
+            if not 0 <= self.snapshot_start_byte <= self.snapshot_end_byte <= self.snapshot_bytes:
+                raise ValueError("snippet range is outside the snapshot")
+            if self.snapshot_end_byte - self.snapshot_start_byte != len(self.snippet.encode("utf-8")):
+                raise ValueError("snapshot range must equal the snippet byte length")
         return self
 
 
@@ -652,9 +670,14 @@ class ContextBudget(StrictModel):
 
 
 class FailedAttempt(StrictModel):
+    schema_version: Literal[1, 2] = 1
     action: ShortStr
     status: str
     reason: str | None = None
+    call_id: str | None = None
+    arguments_sha256: Sha256 | None = None
+    source_ref: str | None = None
+    retry_condition: str = "unknown"
 
 
 class EvidenceIndexEntry(EvidenceSummary):
@@ -681,6 +704,36 @@ class DisplaySource(StrEnum):
     TOOL_RESULT = "tool_result"
 
 
+class EvidenceWindow(StrictModel):
+    """An exact UTF-8 slice; rendering separators are never part of the text."""
+
+    schema_version: Literal[1] = 1
+    window_id: str = Field(pattern=r"^win-[0-9a-f]{20}$")
+    evidence_id: EvidenceId
+    source_sha256: Sha256
+    snapshot_sha256: Sha256 | None = None
+    span_origin: Literal["evidence_snippet", "captured_snapshot"] = "evidence_snippet"
+    start_byte: StrictInt = Field(ge=0)
+    end_byte: StrictInt = Field(gt=0)
+    line_start: LineNumber | None = None
+    line_end: LineNumber | None = None
+    text: str = Field(min_length=1, max_length=8192)
+    text_sha256: Sha256
+    selection_reason: ShortStr
+    read_cursor: str | None = None
+
+    @model_validator(mode="after")
+    def _range_shape(self) -> "EvidenceWindow":
+        import hashlib
+
+        raw = self.text.encode("utf-8")
+        if len(raw) > 8192 or self.end_byte - self.start_byte != len(raw):
+            raise ValueError("window range must equal its bounded UTF-8 text length")
+        if hashlib.sha256(raw).hexdigest() != self.text_sha256:
+            raise ValueError("window text hash mismatch")
+        return self
+
+
 class DisplayedEvidence(StrictModel):
     """One bounded view of an evidence snippet that the model actually saw.
 
@@ -689,7 +742,7 @@ class DisplayedEvidence(StrictModel):
     they are not proof that the body entered a model request.
     """
 
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
     evidence_id: EvidenceId
     turn: StrictInt = Field(ge=0)
     source: DisplaySource
@@ -700,12 +753,20 @@ class DisplayedEvidence(StrictModel):
     line_end: LineNumber | None = None
     request_id: str | None = None
     source_sha256: Sha256 | None = None
+    window: EvidenceWindow | None = None
 
     @model_validator(mode="after")
     def _v2_requires_request_binding(self) -> "DisplayedEvidence":
-        if self.schema_version == 2:
+        if self.schema_version >= 2:
             if not self.request_id or not self.source_sha256:
                 raise ValueError("display v2 requires request_id and source_sha256")
+        if self.schema_version == 3:
+            if self.window is None or self.window.evidence_id != self.evidence_id:
+                raise ValueError("display v3 requires a matching exact window")
+            if self.window.source_sha256 != self.source_sha256 or self.window.text_sha256 != self.visible_sha256:
+                raise ValueError("display v3 window hashes must match the display record")
+            if len(self.window.text) != self.visible_chars:
+                raise ValueError("display v3 width must match its exact window")
         return self
 
 
@@ -719,6 +780,7 @@ class OmissionImpact(StrictModel):
     evidence_id: EvidenceId | None = None
     request: ShortStr
     reason: ShortStr
+    state: Literal["not_captured", "stored_not_displayed", "partially_displayed", "stale"] = "stored_not_displayed"
     affected_claim_ids: list[str] = Field(default_factory=list, max_length=40)
     affected: list[Literal["report", "handoff", "analysis"]] = Field(default_factory=list, max_length=3)
 
@@ -730,15 +792,19 @@ class InvestigationPhase(StrEnum):
 
 
 class AttemptLedgerEntry(StrictModel):
+    schema_version: Literal[1, 2] = 1
     turn: StrictInt = Field(ge=0)
     action: ShortStr
     status: str
     new_information: StrictBool
     detail: str | None = None
+    call_id: str | None = None
+    arguments_sha256: Sha256 | None = None
+    source_ref: str | None = None
 
 
 class InvestigationState(StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     phase: InvestigationPhase = InvestigationPhase.LOCATE
     active_question: NonEmptyStr
     playbook_id: str | None = None
@@ -760,7 +826,7 @@ class RunPosition(StrictModel):
 
 
 class ContextPacket(StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 2
     run_id: str
     event_id: str
     project_id: ShortStr
@@ -781,6 +847,8 @@ class ContextPacket(StrictModel):
     playbook_version: str | None = None
     playbook_hash: str | None = None
     displayed_count: StrictInt = Field(default=0, ge=0)
+    evidence_windows: list[EvidenceWindow] = Field(default_factory=list, max_length=400)
+    state_projection: dict[str, Any] = Field(default_factory=dict)
     generated_at: datetime
 
 
@@ -835,9 +903,9 @@ class BudgetLimits(StrictModel):
 
 class ContextLimits(StrictModel):
     constraints_tokens: StrictInt = Field(default=1000, ge=0, le=50_000)
-    tool_definitions_tokens: StrictInt = Field(default=1000, ge=0, le=50_000)
+    tool_definitions_tokens: StrictInt = Field(default=1200, ge=0, le=50_000)
     task_facts_tokens: StrictInt = Field(default=2000, ge=0, le=50_000)
-    current_evidence_tokens: StrictInt = Field(default=5000, ge=0, le=100_000)
+    current_evidence_tokens: StrictInt = Field(default=4800, ge=0, le=100_000)
     history_tokens: StrictInt = Field(default=1500, ge=0, le=50_000)
     working_state_tokens: StrictInt = Field(default=1500, ge=0, le=50_000)
     total_input_tokens: StrictInt = Field(default=12_000, ge=1000, le=500_000)

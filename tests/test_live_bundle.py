@@ -46,6 +46,10 @@ def test_bundle_round_trip_and_hc09_import(tmp_path: Path) -> None:
     assert manifest.chain["read_call_id"]
     assert (bundle / "request-views" / "req-000099.json").is_file()
     assert (bundle / "evidence" / "index.json").is_file()
+    index = json.loads((bundle / "evidence/index.json").read_text())
+    snapshots = [item["snapshot_sha256"] for item in index["evidence"] if item.get("snapshot_sha256")]
+    assert snapshots
+    assert all((bundle / "evidence/objects" / f"{digest}.txt").is_file() for digest in snapshots)
 
     evidence = tmp_path / "evidence"
     evidence.mkdir()

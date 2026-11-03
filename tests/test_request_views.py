@@ -38,7 +38,8 @@ def _checks(run_dir: Path) -> dict[str, dict]:
 
 def test_claim_display_fails_when_body_never_enters_provider_request(tmp_path: Path) -> None:
     seen: list[str] = []
-    config = Config(context={"current_evidence_tokens": 0, "working_state_tokens": 0})
+    # Reserve the mandatory sourced state, but leave no room for a tool pair.
+    config = Config(context={"current_evidence_tokens": 0, "working_state_tokens": 200})
     scenario = make_scenario(
         [
             tool_step(("read_file", {"path": "data/checks.json", "start_line": 1, "max_lines": 20})),
@@ -64,8 +65,8 @@ def test_claim_display_fails_when_body_never_enters_provider_request(tmp_path: P
     assert "never displayed" in checks["claim-display"]["scope"]
 
     display = read_json(run_dir / "display.json")
-    assert display["schema_version"] == 2
-    assert all(item["schema_version"] == 2 for item in display["displayed"])
+    assert display["schema_version"] == 3
+    assert all(item["schema_version"] >= 2 for item in display["displayed"])
     assert all(item["evidence_id"] for item in display["displayed"])
 
 
@@ -117,7 +118,7 @@ def test_earlier_request_view_counts_after_the_pair_is_compacted(tmp_path: Path)
     config = Config(
         context={
             "current_evidence_tokens": 0,
-            "working_state_tokens": 240,
+            "working_state_tokens": 1500,
         }
     )
     scenario = make_scenario(
@@ -208,3 +209,21 @@ def test_request_ids_do_not_collide_after_a_gap(tmp_path: Path) -> None:
     )
     assert view.request_id == "req-000004"
     assert (store.directory / "req-000004.json").is_file()
+
+
+def test_historical_v2_request_keeps_its_legacy_fragment_without_invented_offsets(tmp_path: Path) -> None:
+    from agent_triage.contracts import EvidenceKind
+    from agent_triage.request_views import RequestViewStore
+    from agent_triage.tools import build_evidence
+
+    item = build_evidence(kind=EvidenceKind.GIT, project_id="fixture", path=".", snippet="historical exact fragment")
+    views = RequestViewStore(tmp_path)
+    view = views.begin(run_id="old-run", turn=0, provider="replay", system=item.snippet,
+                       messages=[], evidence=[item])
+    legacy = view.model_copy(update={"schema_version": 2})
+    views._write(legacy)
+    confirmed = views.mark_response_received(view.request_id)
+    records = views.confirmed_displayed(confirmed)
+    assert records[0].schema_version == 2 and records[0].window is None
+    assert records[0].line_start is None and records[0].line_end is None
+    assert verify_display_records(records, [confirmed], [item]) == ([], "request_view")

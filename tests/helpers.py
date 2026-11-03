@@ -192,6 +192,7 @@ def make_tool_executor(
         run_id=store.run_id,
         policy=policy,
         evidence_lookup=evidence_lookup,
+        evidence_store=evidence,
     )
     return executor, store, evidence, budget, project, output
 
