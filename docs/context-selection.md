@@ -48,7 +48,7 @@ read_evidence(evidence_id, cursor?, max_bytes=8192)
 
 新捕获必须提供显式窗口清单；仅有指针不会产生展示记录。`RequestViewStore` 验证切片、位置、hash 以及最终请求中实际存在的正文；收到响应之后才确认展示。两个不连续窗口分别记录，不把中间区域算作已读。历史 v2 请求和展示按旧契约读取，不补造字节范围。
 
-- 运行时提示词：`prompt-v4`；工具：`tools-v3`，八个受限工具（新增 `record_issue_assessment`，只提交适用性判断，不新增 MCP 权限）。
+- 运行时提示词为 `prompt-v4`，工具版本为 `tools-v4`。八个受限工具包括要求引用候选正文的 `record_issue_assessment`。
 - Evidence 与证据索引：v2；ContextPacket：v2；调查账本新增字段为 v2。
 - RequestView 与新窗口展示：v3；窗口契约自身为 v1。
 - 旧运行读取兼容，不允许用新运行时版本悄悄续跑旧检查点，沿用现有版本校验。

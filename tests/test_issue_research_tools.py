@@ -187,19 +187,30 @@ def test_search_and_read_bind_real_identity_and_receipt(tmp_path: Path) -> None:
     assert candidate is not None and candidate.read
     read_evidence = read.data["evidence_id"]
 
+    assessment_args = {
+        "issue_ref": "example/application#12",
+        "component": "match",
+        "symptom": "match",
+        "version": "unknown",
+        "environment": "unknown",
+        "trigger": "unknown",
+        "fix": "unknown",
+    }
+    summary_only = executor.execute(
+        "record_issue_assessment",
+        {**assessment_args, "evidence_refs": [candidate.search_evidence_id]},
+        call_id="call-3",
+        turn=0,
+    )
+    assert summary_only.status.value == "error"
+    assert summary_only.error_code == "assessment_missing_issue_body_evidence"
+    assert candidate.assessment is None
+    assert not controller.finished
+
     assessment = executor.execute(
         "record_issue_assessment",
-        {
-            "issue_ref": "example/application#12",
-            "component": "match",
-            "symptom": "match",
-            "version": "unknown",
-            "environment": "unknown",
-            "trigger": "unknown",
-            "fix": "unknown",
-            "evidence_refs": [read_evidence],
-        },
-        call_id="call-3",
+        {**assessment_args, "evidence_refs": [candidate.search_evidence_id, read_evidence]},
+        call_id="call-4",
         turn=0,
     )
     assert assessment.status.value == "ok", assessment.data

@@ -23,10 +23,10 @@
 - 搜索范围由配置上限和控制器决定；模型查询拒绝 `repo:`、`org:`、`is:`、布尔运算、否定和引号。依赖层只使用配置中的“包 → 上游仓库”映射。
 - 候选身份从响应中的仓库字段、API/HTML URL 或 `issue_ref` 交叉核对；跨仓库后保留真实 `owner/repo#number`，不再用 `mcp.repo` 拼接。
 - 搜索回执绑定 run、层级、范围、查询 hash、调用 id、证据快照与候选列表，写入 checkpoint；`issue-research.json` 记录逐层过程。
-- 新工具 `record_issue_assessment` 记录六个维度的 `match`/`mismatch`/`unknown`；程序校验候选已读、证据已展示后提交，`component`/`symptom` 匹配且无冲突才停止扩大。
+- 新工具 `record_issue_assessment` 记录六个维度的 `match`/`mismatch`/`unknown`。评估必须引用该候选已展示的正文证据，`component`/`symptom` 匹配且无冲突才停止扩大。
 - 最终 `analysis.related_issues` 与报告中的“分层 Issue 检索”保留层级和适用性；适用线索不升级为已确认根因。
 
-运行时版本为 `policy-v2` / `prompt-v4` / `tools-v3`；`Config v1` 默认仍是单仓库 legacy 行为，layered 模式要求 `schema_version = 2`。真实模型 / MCP 分层联调为 `not_run`。
+运行时版本为 `policy-v3` / `prompt-v4` / `tools-v4`。`Config v1` 默认仍是单仓库 legacy 行为，layered 模式要求 `schema_version = 2`。真实模型 / MCP 分层联调为 `not_run`。
 
 ## 接下来优先处理
 

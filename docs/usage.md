@@ -33,7 +33,7 @@
 2. 配置中映射、且症状里出现包名或 import 名的依赖上游：`repo:<映射仓库>`；
 3. 配置允许时，公共层：`is:public`。
 
-每层先用有界查询搜索，再读取排名靠前的候选正文，再由模型用 `record_issue_assessment` 逐项记录 `component`、`symptom`、`version`、`environment`、`trigger`、`fix` 的 `match`/`mismatch`/`unknown`。程序只接受本次运行搜索回执中出现、已读取且证据已展示的候选；`component`/`symptom` 匹配且没有已知冲突才停止扩大范围。没有评估的候选按“未核对”处理，继续下一层并保留缺口。
+每层先用有界查询搜索，再读取排名靠前的候选正文，再由模型用 `record_issue_assessment` 逐项记录 `component`、`symptom`、`version`、`environment`、`trigger`、`fix` 的 `match`/`mismatch`/`unknown`。评估必须引用本次运行已向模型展示的该候选正文证据，可以附上其他已展示的证据。`component`/`symptom` 匹配且没有已知冲突才停止扩大范围。没有评估的候选按“未核对”处理，继续下一层并保留缺口。
 
 依赖仓库只来自配置，不从日志或 Issue 正文推断。`max_searches`、`max_issue_reads`、`max_remote_requests` 是整个运行的上限，与现有工具/模型/时间预算叠加；恢复运行保留层级、候选回执和已用次数。搜索失败、截断或评论未读完都保留为覆盖不足，不会被解释成“没有相关问题”。
 

@@ -49,10 +49,10 @@ def test_versions_are_frozen_into_context_and_checkpoint(tmp_path: Path) -> None
     result, _, output = run_replay(tmp_path)
     run_dir = output / result.run_id
     versions = __import__("json").loads((run_dir / "versions.json").read_text(encoding="utf-8"))
-    assert versions["policy_version"] == "policy-v2"
+    assert versions["policy_version"] == "policy-v3"
     assert len(versions["policy_hash"]) == 64
     assert versions["prompt_version"] == "prompt-v4"
-    assert versions["tool_schema_version"] == "tools-v3"
+    assert versions["tool_schema_version"] == "tools-v4"
     assert versions["playbook_id"]
     assert versions["playbook_hash"]
     checkpoint = __import__("json").loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))

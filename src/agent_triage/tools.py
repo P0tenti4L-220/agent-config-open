@@ -175,8 +175,8 @@ TOOL_DEFINITIONS: dict[str, tuple[type[StrictModel], str]] = {
     "record_issue_assessment": (
         RecordIssueAssessmentArgs,
         "Record a per-dimension applicability assessment for one issue candidate located and "
-        "read in this run. Each dimension is match/mismatch/unknown with local and remote evidence ids; "
-        "this never confirms a root cause.",
+        "read in this run. evidence_refs must include the displayed evidence id from reading that "
+        "candidate's body. Each dimension is match/mismatch/unknown; this never confirms a root cause.",
     ),
     "read_evidence": (
         ReadEvidenceArgs,
@@ -1425,6 +1425,11 @@ class ToolExecutor:
             )
         if not candidate.read:
             raise ToolFailure("issue_not_read", "read the issue body before assessing it")
+        if candidate.read_evidence_id not in args.evidence_refs:
+            raise ToolFailure(
+                "assessment_missing_issue_body_evidence",
+                "assessment must cite the displayed body evidence from reading this issue",
+            )
         for evidence_id in args.evidence_refs:
             if self.evidence_lookup is not None and not self.evidence_lookup(evidence_id):
                 raise ToolFailure("unknown_evidence", "assessment cites evidence that is not registered in this run")
