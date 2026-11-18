@@ -6,8 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from agent_triage.cli import main
 from agent_triage.contracts import Outcome
-from agent_triage.errors import OutcomeRejected
+from agent_triage.errors import OutcomeRejected, StoreError
 from agent_triage.feedback import record_outcome
 from agent_triage.store import EvidenceStore, LessonStore, RunStore, hash_file
 from helpers import run_replay
@@ -133,3 +134,89 @@ def test_v2_valid_outcome_promotes_with_scope_and_imported_output(tmp_path: Path
     handoff = (store.dir / "handoff.md").read_text(encoding="utf-8")
     assert "resolved" in handoff
     assert "adapter-check" in handoff
+
+
+def test_rejected_feedback_keeps_verified_run_and_independent_audits(tmp_path: Path, capsys) -> None:
+    result, project, output, store, evidence, lessons = _setup(tmp_path)
+    outcome_path = tmp_path / "outcome.json"
+    args = [
+        "record-outcome", "--run-id", result.run_id, "--outcome", str(outcome_path),
+        "--output", str(output),
+    ]
+    payload = _outcome(result.run_id, project)
+    outcome_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert main(args) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["status"] == "resolved"
+    paths = [
+        *(store.dir / name for name in (
+            "checks.json", "promotion-check.json", "outcome.json", "run.json", "report.md", "handoff.md"
+        )),
+        output / "index.json",
+        lessons.path,
+        *list((store.dir / "evidence/outcomes").iterdir()),
+    ]
+    hashes = {path: hash_file(path) for path in paths}
+    payload["owner_confirmed"] = False
+    outcome_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert main(args) == 1
+    assert "owner_confirmed is false" in capsys.readouterr().err
+    payload["owner_confirmed"] = True
+    payload["commands"][0]["target_sha256"] = "0" * 64
+    outcome_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert main(args) == 1
+    assert "old hash" in capsys.readouterr().err
+    assert {path: hash_file(path) for path in paths} == hashes
+
+    audit_dir = store.dir / "outcome-audits"
+    audits = {path: json.loads(path.read_text(encoding="utf-8")) for path in audit_dir.glob("*.json")}
+    assert len(audits) == 3
+    assert audits[audit_dir / f"{receipt['outcome_id']}.json"]["receipt"] == receipt
+    rejected = [audit for audit in audits.values() if audit["gate"]["decision"] == "deny"]
+    assert len(rejected) == 2
+    assert all(audit["receipt"] is None and not audit["record"]["promoted"] for audit in rejected)
+    assert main(args) == 1
+    assert {path: json.loads(path.read_text(encoding="utf-8")) for path in audit_dir.glob("*.json")} == audits
+
+
+@pytest.mark.parametrize("failed_write", ["promotion-check.json", "outcome.json", "receipt"])
+def test_retry_after_interrupted_promotion_returns_one_receipt(
+    tmp_path: Path, monkeypatch, failed_write: str
+) -> None:
+    result, project, output, store, evidence, lessons = _setup(tmp_path)
+    outcome = Outcome.model_validate(_outcome(result.run_id, project))
+    write_json = store.write_json
+
+    def interrupt(name, payload):
+        if name == failed_write or (failed_write == "receipt" and payload.get("receipt")):
+            raise StoreError("feedback write interrupted")
+        return write_json(name, payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "write_json", interrupt)
+        with pytest.raises(StoreError, match="feedback write interrupted"):
+            record_outcome(store=store, evidence=evidence, lesson_store=lessons, outcome=outcome)
+    pending_path = store.dir / "outcome-audits/.pending.json"
+    pending = json.loads(pending_path.read_text(encoding="utf-8"))
+    assert pending["gate"]["decision"] == "allow"
+    assert pending["record"]["promoted"] is False
+    assert "receipt" not in pending
+    audit_path = pending_path.with_name(f"{pending['outcome_id']}.json")
+    assert not audit_path.exists()
+    if failed_write != "receipt":
+        assert not (store.dir / "outcome.json").exists()
+
+    # The next CLI process can finish from the pinned output snapshot.
+    (project / "pytest.log").unlink()
+    store = RunStore.load(output, result.run_id)
+    receipt = record_outcome(store=store, evidence=EvidenceStore(store), lesson_store=lessons, outcome=outcome)
+    assert receipt["promoted"] is True and receipt["status"] == "resolved"
+    assert not pending_path.exists()
+    report = store.dir / "report.md"
+    assert report.read_text(encoding="utf-8").count("## 外部验证记录") == 1
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert audit["receipt"] == receipt and audit["record"]["promoted"] is True
+    paths = (audit_path, report, store.dir / "outcome.json", store.dir / "checks.json", lessons.path)
+    hashes = {path: hash_file(path) for path in paths}
+    assert record_outcome(store=store, evidence=EvidenceStore(store), lesson_store=lessons, outcome=outcome) == receipt
+    assert {path: hash_file(path) for path in paths} == hashes

@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,14 +28,16 @@ from .contracts import (
     OutcomeCommand,
     VerificationRecord,
 )
-from .errors import InputError, OutcomeRejected, StoreError, ValidationFailure
+from .errors import InputError, OutcomeRejected, StoreError
 from .lifecycle import Decision, LifecycleEvent, build_default_engine
 from .render import checks_to_json, render_handoff, render_lesson_candidate
 from .store import (
     EvidenceStore,
     LessonStore,
     RegistryStore,
+    RunStatus,
     RunStore,
+    exclusive_file_lock,
     hash_file,
     read_json,
     utcnow,
@@ -44,6 +45,8 @@ from .store import (
 from .tools import is_sensitive
 
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+AUDIT_DIR = "outcome-audits"
+PENDING_AUDIT = f"{AUDIT_DIR}/.pending.json"
 
 
 def load_outcome(path: Path) -> Outcome:
@@ -66,8 +69,29 @@ def record_outcome(
 ) -> dict[str, Any]:
     if outcome.run_id != store.run_id:
         raise InputError("outcome.run_id does not match the target run")
-    if not store.exists("analysis.json"):
-        raise InputError("run has no analysis.json; feedback requires a finished analysis")
+    payload = outcome.model_dump(mode="json")
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    outcome_id = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    audit_path = f"{AUDIT_DIR}/{outcome_id}.json"
+    # Serialize feedback callers and coordinate with the analysis writer.
+    with exclusive_file_lock(store.dir / AUDIT_DIR / ".lock"), store.acquire_lock():
+        store.meta = RunStore.load(store.output_root, store.run_id).meta
+        if store.exists(PENDING_AUDIT):
+            _commit_outcome(store, lesson_store, store.read_json(PENDING_AUDIT))
+        if store.exists(audit_path):
+            audit = store.read_json(audit_path)
+        else:
+            if not store.exists("analysis.json"):
+                raise InputError("run has no analysis.json; feedback requires a finished analysis")
+            audit = _prepare_outcome(store, outcome, outcome_id)
+            store.write_json(PENDING_AUDIT, audit)
+            audit = _commit_outcome(store, lesson_store, audit)
+    if audit["receipt"] is None:
+        raise OutcomeRejected(audit["rejection"], detail="; ".join(audit["record"]["reasons"][:8]))
+    return audit["receipt"]
+
+
+def _prepare_outcome(store: RunStore, outcome: Outcome, outcome_id: str) -> dict[str, Any]:
     event = Event.model_validate(store.read_json("event.json"))
     analysis = Analysis.model_validate(store.read_json("analysis.json"))
     project_root = store.project_root()
@@ -120,6 +144,9 @@ def record_outcome(
     elif not check_ids:
         reasons.append("no planned check was bound to the v2 outcome")
 
+    lesson = _load_or_build_lesson(store, event, analysis)
+    if not reasons and lesson is None:
+        reasons.append("analysis has no reusable lesson content to verify")
     engine = build_default_engine(run_id=store.run_id)
     gate = engine.evaluate(
         LifecycleEvent.BEFORE_PROMOTE_LESSON,
@@ -127,85 +154,50 @@ def record_outcome(
     )
     if gate.decision == Decision.DENY and not reasons:
         reasons.append(f"{gate.rule_id}/{gate.reason_code}: {gate.message}")
-    store.write_json(
-        "promotion-check.json",
-        {
-            "schema_version": 1,
-            "schema_outcome": outcome.schema_version,
-            "reasons": reasons,
-            "decision": gate.decision.value,
-            "rule_id": gate.rule_id,
-            "reason_code": gate.reason_code,
-            "check_ids": check_ids,
-            "outputs": imports,
-            "lifecycle": engine.dump(),
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
 
+    recorded_at = utcnow().isoformat()
+    promotion = {
+        "schema_version": 1,
+        "outcome_id": outcome_id,
+        "schema_outcome": outcome.schema_version,
+        "reasons": reasons,
+        "decision": gate.decision.value,
+        "rule_id": gate.rule_id,
+        "reason_code": gate.reason_code,
+        "check_ids": check_ids,
+        "outputs": imports,
+        "lifecycle": engine.dump(),
+        "recorded_at": recorded_at,
+    }
     outcome_record = {
         "schema_version": 2,
+        "outcome_id": outcome_id,
         "outcome": outcome.model_dump(mode="json"),
         "current_target_hashes": target_hashes,
         "imported_outputs": imports,
         "reasons": reasons,
-        "promoted": not reasons,
-        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "promoted": False,
+        "recorded_at": recorded_at,
     }
-    store.write_json("outcome.json", outcome_record)
+    if not reasons and lesson is not None:
+        lesson = _verified_lesson(lesson, event, outcome, target_hashes, check_ids, imports)
+    return {
+        "schema_version": 1,
+        "outcome_id": outcome_id,
+        "record": outcome_record,
+        "gate": promotion,
+        "lesson": lesson.model_dump(mode="json") if lesson is not None else None,
+    }
 
-    lesson = _load_or_build_lesson(store, event, analysis)
-    checks = _load_checks(store)
-    if reasons:
-        if lesson is not None and lesson.status == LessonStatus.CANDIDATE:
-            lesson_store.upsert(lesson)
-        store.set_status("awaiting_verification")
-        try:
-            RegistryStore(store.output_root).set_run_status(store.run_id, "awaiting_verification")
-        except StoreError:
-            pass
-        has_failed_exit = any(command.exit_code != 0 for command in outcome.commands)
-        checks = [check for check in checks if check.check_id != "outcome-verification"]
-        if has_failed_exit and all(command.output_ref for command in outcome.commands):
-            failed = next(command for command in outcome.commands if command.exit_code != 0)
-            checks.append(
-                CheckResult(
-                    check_id="outcome-verification",
-                    status=CheckStatus.FAIL,
-                    description="external verification command reported a non-zero exit code",
-                    command=failed.command,
-                    exit_code=failed.exit_code,
-                    output_ref=failed.output_ref,
-                    target_sha256=failed.target_sha256,
-                    scope="external executor supplied this result; the agent did not run it",
-                    executed_by=outcome.executed_by,
-                    executed_at=outcome.executed_at,
-                )
-            )
-        else:
-            outcome_sha = hash_file(store.dir / "outcome.json")
-            checks.append(
-                CheckResult(
-                    check_id="outcome-verification",
-                    status=CheckStatus.ERROR,
-                    description="verification is incomplete or does not prove the planned check",
-                    command=" && ".join(command.command for command in outcome.commands)[:500],
-                    exit_code=0,
-                    output_ref="outcome.json",
-                    target_sha256=outcome_sha,
-                    scope="; ".join(reasons[:5]),
-                    executed_by=outcome.executed_by,
-                    executed_at=outcome.executed_at,
-                )
-            )
-        store.write_json("checks.json", checks_to_json(checks))
-        raise OutcomeRejected(
-            "verification did not satisfy the promotion contract; lesson remains a candidate",
-            detail="; ".join(reasons[:8]),
-        )
 
-    if lesson is None:
-        raise ValidationFailure("analysis has no reusable lesson content to verify")
+def _verified_lesson(
+    lesson: Lesson,
+    event: Event,
+    outcome: Outcome,
+    target_hashes: dict[str, str],
+    check_ids: list[str],
+    imports: list[dict[str, Any]],
+) -> Lesson:
     primary = outcome.commands[0]
     verification = VerificationRecord(
         command=" && ".join(command.command for command in outcome.commands)[:2000],
@@ -225,13 +217,13 @@ def record_outcome(
         output_refs=[item["snapshot"] for item in imports],
         contract="v2",
     )
-    verified = Lesson.model_validate(
+    return Lesson.model_validate(
         {
             **lesson.model_dump(mode="json"),
             "status": LessonStatus.VERIFIED.value,
             "verification": verification.model_dump(mode="json"),
             "applicable_versions": [event.rule_version],
-            "source_run_id": store.run_id,
+            "source_run_id": outcome.run_id,
             "source_check_ids": sorted(set(check_ids)),
             "promotion_reason": (
                 "owner-confirmed external verification of planned checks "
@@ -239,7 +231,101 @@ def record_outcome(
             ),
         }
     )
-    lesson_store.upsert(verified)
+
+
+def _commit_outcome(store: RunStore, lesson_store: LessonStore, audit: dict[str, Any]) -> dict[str, Any]:
+    audit_path = f"{AUDIT_DIR}/{audit['outcome_id']}.json"
+    if store.exists(audit_path):
+        committed = store.read_json(audit_path)
+    else:
+        outcome = Outcome.model_validate(audit["record"]["outcome"])
+        checks = _load_checks(store)
+        lesson = Lesson.model_validate(audit["lesson"]) if audit["lesson"] is not None else None
+        reasons = audit["record"]["reasons"]
+        committed = {**audit, "receipt": None}
+        if reasons:
+            protected = store.meta.status == "resolved" or any(
+                check.check_id == "outcome-verification" and check.status == CheckStatus.PASS
+                for check in checks
+            )
+            committed["rejection"] = "verification did not satisfy the promotion contract"
+            if not protected:
+                if lesson is not None and lesson.status == LessonStatus.CANDIDATE:
+                    lesson_store.upsert(lesson)
+                _record_rejected_check(store, outcome, audit, checks)
+                committed["rejection"] += "; lesson remains a candidate"
+        else:
+            if lesson is None or lesson.verification is None:
+                raise StoreError("prepared feedback has no verified lesson")
+            for imported in audit["record"]["imported_outputs"]:
+                snapshot = imported["snapshot"]
+                if not store.exists(snapshot) or hash_file(store.dir / snapshot) != imported["sha256"]:
+                    raise StoreError("prepared feedback output snapshot is missing or changed")
+            checks = _promote_outcome(store, lesson_store, outcome, audit, lesson, checks)
+            committed["record"] = {**audit["record"], "promoted": True}
+            store.write_json("outcome.json", committed["record"])
+            committed["receipt"] = {
+                "run_id": store.run_id,
+                "promoted": True,
+                "lesson_id": lesson.lesson_id,
+                "outcome_id": audit["outcome_id"],
+                "status": "resolved",
+                "checks": [check.model_dump(mode="json") for check in checks],
+            }
+        store.write_json(audit_path, committed)
+    (store.dir / PENDING_AUDIT).unlink()
+    return committed
+
+
+def _record_rejected_check(
+    store: RunStore, outcome: Outcome, audit: dict[str, Any], checks: list[CheckResult]
+) -> None:
+    store.write_json("promotion-check.json", audit["gate"])
+    store.write_json("outcome.json", audit["record"])
+    failed = next((command for command in outcome.commands if command.exit_code != 0), None)
+    if failed is not None and all(command.output_ref for command in outcome.commands):
+        check = CheckResult(
+            check_id="outcome-verification",
+            status=CheckStatus.FAIL,
+            description="external verification command reported a non-zero exit code",
+            command=failed.command,
+            exit_code=failed.exit_code,
+            output_ref=failed.output_ref,
+            target_sha256=failed.target_sha256,
+            scope="external executor supplied this result; the agent did not run it",
+            executed_by=outcome.executed_by,
+            executed_at=outcome.executed_at,
+        )
+    else:
+        check = CheckResult(
+            check_id="outcome-verification",
+            status=CheckStatus.ERROR,
+            description="verification is incomplete or does not prove the planned check",
+            command=" && ".join(command.command for command in outcome.commands)[:500],
+            exit_code=0,
+            output_ref="outcome.json",
+            target_sha256=hash_file(store.dir / "outcome.json"),
+            scope="; ".join(audit["record"]["reasons"][:5]),
+            executed_by=outcome.executed_by,
+            executed_at=outcome.executed_at,
+        )
+    checks = [existing for existing in checks if existing.check_id != check.check_id]
+    store.write_json("checks.json", checks_to_json([*checks, check]))
+    _update_run_status(store, "awaiting_verification")
+
+
+def _promote_outcome(
+    store: RunStore,
+    lesson_store: LessonStore,
+    outcome: Outcome,
+    audit: dict[str, Any],
+    lesson: Lesson,
+    checks: list[CheckResult],
+) -> list[CheckResult]:
+    verification = lesson.verification
+    assert verification is not None
+    lesson_store.upsert(lesson)
+    store.write_json("promotion-check.json", audit["gate"])
     checks = [check for check in checks if check.check_id != "outcome-verification"]
     checks.append(
         CheckResult(
@@ -249,30 +335,26 @@ def record_outcome(
             command=verification.command,
             exit_code=0,
             output_ref="promotion-check.json",
-            target_sha256=primary.target_sha256,
+            target_sha256=verification.target_sha256,
             scope=(
                 "external executor result; not a reproduction performed by this agent; "
-                f"checks={','.join(verification.check_ids)}; targets={len(target_hashes)}"
+                f"checks={','.join(verification.check_ids)}; targets={len(verification.target_hashes)}"
             ),
             executed_by=outcome.executed_by,
             executed_at=outcome.executed_at,
         )
     )
     store.write_json("checks.json", checks_to_json(checks))
-    store.set_status("resolved")
-    try:
-        RegistryStore(store.output_root).set_run_status(store.run_id, "resolved")
-    except StoreError:
-        pass
-    _append_report_verification(store, outcome, verification, imports)
+    _update_run_status(store, "resolved")
+    _append_report_verification(store, outcome, verification, audit["outcome_id"])
     _refresh_handoff(store)
-    return {
-        "run_id": store.run_id,
-        "promoted": True,
-        "lesson_id": verified.lesson_id,
-        "status": "resolved",
-        "checks": [check.model_dump(mode="json") for check in checks],
-    }
+    return checks
+
+
+def _update_run_status(store: RunStore, status: RunStatus) -> None:
+    if store.meta.status != status:
+        store.set_status(status)
+    RegistryStore(store.output_root).set_run_status(store.run_id, status, missing_ok=True)
 
 
 def _verify_targets(
@@ -321,25 +403,32 @@ def _import_output(store: RunStore, project_root: Path, command: OutcomeCommand)
             return "output_ref is empty; an empty output cannot prove a check"
         if size > MAX_OUTPUT_BYTES:
             return "output_ref is larger than 2 MiB; select a bounded excerpt"
-        raw = source.read_bytes()
+        with source.open("rb") as handle:
+            raw = handle.read(MAX_OUTPUT_BYTES + 1)
         text = raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
         return "output_ref is not UTF-8 text"
     except OSError as exc:
         return f"output_ref cannot be read: {exc}"
+    if not raw or len(raw) > MAX_OUTPUT_BYTES:
+        return "output_ref size changed during import"
     digest = hashlib.sha256(raw).hexdigest()
     if command.output_sha256 is not None and digest != command.output_sha256:
         return "output_sha256 does not match the imported output"
     suffix = source.suffix.lower() if source.suffix.lower() in {".log", ".txt", ".md", ".json", ".xml", ".out"} else ".txt"
     snapshot = f"evidence/outcomes/{digest}{suffix}"
-    store.write_text(snapshot, text)
+    if store.exists(snapshot):
+        if hash_file(store.dir / snapshot) != digest:
+            raise StoreError("stored verification output hash does not match its snapshot name")
+    else:
+        store.write_text(snapshot, text)
     return {
         "check_id": command.check_id,
         "hypothesis_id": command.hypothesis_id,
         "source_ref": raw_ref,
         "snapshot": snapshot,
         "sha256": digest,
-        "bytes": size,
+        "bytes": len(raw),
     }
 
 
@@ -392,7 +481,7 @@ def _append_report_verification(
     store: RunStore,
     outcome: Outcome,
     verification: VerificationRecord,
-    imports: list[dict[str, Any]],
+    outcome_id: str,
 ) -> None:
     path = store.dir / "report.md"
     if not path.exists():
@@ -411,6 +500,15 @@ def _append_report_verification(
         "",
     ]
     existing = path.read_text(encoding="utf-8")
+    marker = f"<!-- outcome:{outcome_id} -->"
+    if marker in existing.splitlines():
+        return
+    # Older completed outcomes wrote the same section without an identifier.
+    if store.exists("outcome.json"):
+        previous = store.read_json("outcome.json")
+        if "outcome_id" not in previous and previous.get("outcome") == outcome.model_dump(mode="json"):
+            if "\n".join(lines).strip() in existing:
+                return
     existing = re.sub(
         r"工作流状态：`[^`]+`",
         f"工作流状态：`{store.meta.status}`",
@@ -419,4 +517,4 @@ def _append_report_verification(
     )
     from .store import atomic_write_text
 
-    atomic_write_text(path, existing.rstrip() + "\n" + "\n".join(lines))
+    atomic_write_text(path, existing.rstrip() + "\n" + "\n".join([*lines, marker, ""]))

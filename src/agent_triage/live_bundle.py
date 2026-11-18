@@ -13,6 +13,7 @@ import hashlib
 import re
 import shutil
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from pydantic import Field, ValidationError, field_validator, model_validator
@@ -20,9 +21,9 @@ from pydantic import Field, ValidationError, field_validator, model_validator
 from .acceptance import Artifact, ExecutionResult, Target, trusted_manifest
 from .case_manifest import case_definition_hash
 from .contracts import CheckStatus, NonEmptyStr, Sha256, StrictInt, StrictModel
-from .errors import InputError, ValidationFailure
+from .errors import InputError, StoreError, ValidationFailure
 from .livecheck import verify_issue_chain
-from .store import atomic_write_json, read_json, utcnow
+from .store import atomic_write_json, exclusive_file_lock, hash_file, read_json, utcnow
 
 BUNDLE_SCHEMA_VERSION = 1
 MAX_FILE_BYTES = 8 * 1024 * 1024
@@ -150,53 +151,73 @@ def write_live_bundle(
 
 def verify_live_bundle(bundle_dir: Path, *, issue_ref: str, marker: str) -> LiveBundleManifest:
     bundle_dir = bundle_dir.resolve()
-    manifest_path = bundle_dir / MANIFEST_NAME
-    if not manifest_path.is_file():
-        raise ValidationFailure("live bundle has no manifest.json")
-    try:
-        manifest = LiveBundleManifest.model_validate(read_json(manifest_path))
-    except (InputError, ValidationError) as exc:
-        raise ValidationFailure("live bundle manifest is invalid", detail=str(exc)) from exc
+    manifest = _read_manifest(bundle_dir)
     if manifest.issue_ref != issue_ref:
         raise ValidationFailure("live bundle was produced for a different issue_ref")
     if manifest.marker != marker:
         raise ValidationFailure("live bundle marker does not match the frozen marker")
     if manifest.marker_sha256 != hashlib.sha256(marker.encode("utf-8")).hexdigest():
         raise ValidationFailure("live bundle marker hash is inconsistent")
+    if sum(item.size for item in manifest.files if item.relative_path != CHAIN_NAME) > MAX_BUNDLE_BYTES:
+        raise ValidationFailure("live bundle exceeds the total size limit")
     listed: set[str] = set()
     for item in manifest.files:
         if not _is_allowed_relative(item.relative_path):
             raise ValidationFailure(
                 f"live bundle lists a path outside the allowlist: {item.relative_path}"
             )
+        if item.relative_path in listed or PurePosixPath(item.relative_path).as_posix() != item.relative_path:
+            raise ValidationFailure("live bundle contains a duplicate or non-canonical path")
         path = (bundle_dir / item.relative_path).resolve()
         if bundle_dir not in path.parents:
             raise ValidationFailure("live bundle file escapes the bundle directory")
         if not path.is_file():
             raise ValidationFailure(f"live bundle file is missing: {item.relative_path}")
-        data = path.read_bytes()
+        with path.open("rb") as handle:
+            data = handle.read(item.size + 1)
         if len(data) != item.size:
             raise ValidationFailure(f"live bundle file size changed: {item.relative_path}")
         if hashlib.sha256(data).hexdigest() != item.sha256:
             raise ValidationFailure(f"live bundle file hash changed: {item.relative_path}")
         listed.add(item.relative_path)
-    present = {
-        path.relative_to(bundle_dir).as_posix()
-        for path in bundle_dir.rglob("*")
-        if path.is_file() and path.name != MANIFEST_NAME
-    }
-    if present - listed:
+    present: set[str] = set()
+    for path in bundle_dir.rglob("*"):
+        if path.is_symlink() or not (path.is_file() or path.is_dir()):
+            raise ValidationFailure("live bundle must contain only regular files and directories")
+        if path.is_file():
+            present.add(path.relative_to(bundle_dir).as_posix())
+    extra = present - listed - {MANIFEST_NAME}
+    if extra:
         raise ValidationFailure(
             "live bundle contains files not covered by the manifest: "
-            + ", ".join(sorted(present - listed)[:3])
+            + ", ".join(sorted(extra)[:3])
         )
+    if "evidence/index.json" not in listed:
+        raise ValidationFailure("live bundle has no evidence index")
+    if CHAIN_NAME not in listed:
+        raise ValidationFailure("live bundle has no chain.json")
     run_payload = read_json(bundle_dir / "run.json")
     if str(run_payload.get("run_id")) != manifest.run_id:
         raise ValidationFailure("live bundle run.json and manifest run_id differ")
     chain = verify_issue_chain(bundle_dir, issue_ref=issue_ref, marker=marker)
-    if chain.get("read_call_id") != manifest.chain.get("read_call_id"):
+    # The recomputation reports the physical directory name, which may be a
+    # staging name. The chain written by write_live_bundle uses the run id.
+    chain["run_id"] = manifest.run_id
+    if chain != manifest.chain or chain != read_json(bundle_dir / CHAIN_NAME):
         raise ValidationFailure("live bundle manifest and recomputed chain disagree")
     return manifest
+
+
+def _read_manifest(bundle_dir: Path) -> LiveBundleManifest:
+    manifest_path = bundle_dir / MANIFEST_NAME
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise ValidationFailure("live bundle has no manifest.json")
+    if manifest_path.stat().st_size > MAX_FILE_BYTES:
+        raise ValidationFailure("live bundle manifest is too large")
+    try:
+        return LiveBundleManifest.model_validate(read_json(manifest_path))
+    except (InputError, ValidationError) as exc:
+        raise ValidationFailure("live bundle manifest is invalid", detail=str(exc)) from exc
 
 
 def import_live_bundle(
@@ -211,49 +232,101 @@ def import_live_bundle(
         raise InputError("attempt id must contain only letters, digits, dot, underscore or dash")
     bundle_dir = bundle_dir.resolve()
     evidence_dir = evidence_dir.resolve()
-    manifest_path = bundle_dir / MANIFEST_NAME
-    if not manifest_path.is_file():
-        raise ValidationFailure("live bundle has no manifest.json")
-    try:
-        raw = read_json(manifest_path)
-        manifest = LiveBundleManifest.model_validate(raw)
-    except (InputError, ValidationError) as exc:
-        raise ValidationFailure("live bundle manifest is invalid", detail=str(exc)) from exc
-    # The manifest carries the frozen marker; verify_live_bundle re-runs the
-    # complete issue chain against the copied artifacts before import.
-    issue_ref = manifest.issue_ref
-    if not (bundle_dir / "evidence" / "index.json").is_file():
-        raise ValidationFailure("live bundle has no evidence index")
-    verify_live_bundle(bundle_dir, issue_ref=issue_ref, marker=manifest.marker)
-
+    manifest = _read_manifest(bundle_dir)
+    destination = evidence_dir / "live" / manifest.bundle_id
+    lock_path = evidence_dir / ".import-live.lock"
     case_manifest = trusted_manifest(project_root)
     case_hash = None
     if case_manifest is not None and "HC09" in case_manifest.cases:
         case_hash = case_definition_hash(case_manifest.cases["HC09"])
 
-    destination = evidence_dir / "live" / manifest.bundle_id
-    if destination.resolve() != bundle_dir:
-        if destination.exists():
-            shutil.rmtree(destination)
+    try:
+        if bundle_dir == destination:
+            with exclusive_file_lock(lock_path):
+                artifacts = _verified_artifacts(bundle_dir, destination, evidence_dir, manifest)
+                return _publish_import(
+                    bundle_dir, destination, evidence_dir, manifest, artifacts, attempt, case_hash, evaluation_id
+                )
+        if destination.parent.resolve().is_relative_to(bundle_dir):
+            raise InputError("live evidence directory cannot be nested in the source bundle")
+        source_artifacts = _verified_artifacts(bundle_dir, destination, evidence_dir, manifest)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(bundle_dir, destination)
+        # The extra directory level hides abandoned staging files from the eval
+        # discovery glob (live/*/manifest.json).
+        with TemporaryDirectory(prefix=".import-", dir=destination.parent) as temp_dir:
+            staged = Path(temp_dir) / manifest.bundle_id
+            shutil.copytree(bundle_dir, staged, symlinks=True)
+            artifacts = _verified_artifacts(staged, destination, evidence_dir, manifest)
+            if artifacts != source_artifacts:
+                raise ValidationFailure("live bundle changed during import")
+            with exclusive_file_lock(lock_path):
+                return _publish_import(
+                    staged, destination, evidence_dir, manifest, artifacts, attempt, case_hash, evaluation_id
+                )
+    except OSError as exc:
+        raise StoreError("cannot import live bundle", detail=str(exc)) from exc
 
-    artifacts: list[Artifact] = []
-    for path in sorted(destination.rglob("*")):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(evidence_dir).as_posix()
-        data = path.read_bytes()
-        artifacts.append(
-            Artifact(
-                relative_path=relative,
-                sha256=hashlib.sha256(data).hexdigest(),
-                media_type="application/json" if path.suffix == ".json" else "text/plain",
-            )
+
+def _verified_artifacts(
+    source: Path, destination: Path, evidence_dir: Path, manifest: LiveBundleManifest
+) -> list[Artifact]:
+    manifest_hash = hash_file(source / MANIFEST_NAME)
+    verified = verify_live_bundle(source, issue_ref=manifest.issue_ref, marker=manifest.marker)
+    if verified != manifest or hash_file(source / MANIFEST_NAME) != manifest_hash:
+        raise ValidationFailure("live bundle manifest changed during import")
+    files = {item.relative_path: item.sha256 for item in manifest.files}
+    files[MANIFEST_NAME] = manifest_hash
+    return [
+        Artifact(
+            relative_path=(destination / relative).relative_to(evidence_dir).as_posix(),
+            sha256=files[relative],
+            media_type="application/json" if relative.endswith(".json") else "text/plain",
         )
+        for relative in sorted(files)
+    ]
+
+
+def _publish_import(
+    source: Path,
+    destination: Path,
+    evidence_dir: Path,
+    manifest: LiveBundleManifest,
+    artifacts: list[Artifact],
+    attempt: str,
+    case_hash: str | None,
+    evaluation_id: str | None,
+) -> tuple[ExecutionResult, Path]:
+    already_published = destination.exists() or destination.is_symlink()
+    if already_published and source != destination:
+        try:
+            same_bundle = not destination.is_symlink() and (
+                _verified_artifacts(destination, destination, evidence_dir, manifest) == artifacts
+            )
+        except (InputError, OSError, ValidationFailure):
+            same_bundle = False
+        if not same_bundle:
+            raise ValidationFailure(f"live bundle id conflict: {manifest.bundle_id} already exists with different content")
+
+    path = evidence_dir / "results" / f"HC09-{attempt}.json"
+    existing = None
+    conflict = f"HC09 attempt {attempt!r} already exists; use a new --attempt"
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not already_published:
+            raise ValidationFailure(conflict)
+        try:
+            existing = ExecutionResult.model_validate(read_json(path))
+        except (InputError, ValidationError) as exc:
+            raise ValidationFailure(conflict) from exc
+    selected = artifacts[:50]
+    manifest_path = (destination / MANIFEST_NAME).relative_to(evidence_dir).as_posix()
+    manifest_artifact = next(artifact for artifact in artifacts if artifact.relative_path == manifest_path)
+    if manifest_artifact not in selected:
+        # Bind even a large bundle to every file hash through its manifest.
+        selected.append(manifest_artifact)
     result = ExecutionResult(
         evaluation_id=evaluation_id
         or _evidence_evaluation_id(evidence_dir)
+        or (existing.evaluation_id if existing else None)
         or (
             utcnow().strftime("eval-%Y%m%d-%H%M%S-")
             + hashlib.sha256(manifest.bundle_id.encode()).hexdigest()[:6]
@@ -270,10 +343,16 @@ def import_live_bundle(
             "executor_id": "live-bundle",
         },
         related_run_ids=[manifest.run_id],
-        artifacts=artifacts[:50],
+        artifacts=selected,
         nodes=[],
     )
-    path = evidence_dir / "results" / f"HC09-{attempt}.json"
+    if existing is not None:
+        # Keep the original case binding even after the case definition changes.
+        if existing != result.model_copy(update={"case_definition_hash": existing.case_definition_hash}):
+            raise ValidationFailure(conflict)
+        return existing, path
+    if not already_published:
+        source.rename(destination)
     atomic_write_json(path, result.model_dump(mode="json"))
     return result, path
 
