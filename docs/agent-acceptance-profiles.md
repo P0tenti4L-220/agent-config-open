@@ -86,6 +86,7 @@ live smoke 实际运行成功后写出 bundle（`manifest.json`、`chain.json`�
 1. 校验 bundle 文件清单、路径、大小与 sha256，拒绝未登记文件；
 2. 重算 issue 链路：搜索命中指定 issue、唯一读取、`issue_ref` 一致、`evidence_refs` 指向 issue 证据、请求视图中出现 call id 与 result id、证据片段确实进入收到响应的请求、display hash 匹配、claim 引用该证据；
 3. 校验 bundle 的 `run_id` 与 `run.json` 一致；
-4. 用当前 `tests/cases` 的 HC09 定义计算 `case_definition_hash`，写入 `results/HC09-<attempt>.json`，`source_type=run_artifact`，并绑定 bundle 的 target。
+4. 外部 bundle 先复制到 `evidence/live/` 下的临时目录，重验副本后在锁内发布。已经位于目标位置的评测 bundle 可直接校验。已有同名 bundle 的内容不同就报错并保留原件。
+5. 用当前 `tests/cases` 的 HC09 定义计算 `case_definition_hash`，写入 `results/HC09-<attempt>.json`，`source_type=run_artifact`，并绑定 bundle 的 target。重复导入同一 bundle 和尝试编号会返回原记录。编号已被其他结果占用时，使用新的 `--attempt`。如果 bundle 已发布而结果写入失败，重试可补写缺失的结果。
 
 `run_artifact` 的 pass 还要求非空 `related_run_ids` 与可校验的 `artifacts`；因此只写一个 `source_type=run_artifact`、`exit_code=0` 的空结果不会通过。pytest 退出码 0、HC09 的占位 pass 或没有 request-view 的旧 bundle 都不能替代这一步。

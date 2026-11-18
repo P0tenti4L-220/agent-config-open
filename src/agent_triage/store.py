@@ -9,6 +9,8 @@ import re
 import secrets
 import shutil
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -118,6 +120,23 @@ def hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+@contextmanager
+def exclusive_file_lock(path: Path) -> Iterator[None]:
+    """Serialize local writers. Keep the lock file so waiters share its inode."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -188,63 +207,64 @@ class RegistryStore:
         provider: str,
     ) -> tuple[int, bool, str]:
         """Return (fingerprint occurrence, duplicate event?, fingerprint)."""
-        registry = self.load()
-        now = utcnow()
-        existing = registry.events.get(event_id)
-        duplicate_event = existing is not None
-        group = registry.fingerprints.get(fingerprint)
-        if group is None:
-            group = RegistryFingerprint(
-                algorithm=fingerprint_algorithm,
-                occurrence=1,
-                symptom=symptom[:500],
-                event_ids=[event_id],
+        with exclusive_file_lock(self.path.with_suffix(".lock")):
+            registry = self.load()
+            now = utcnow()
+            existing = registry.events.get(event_id)
+            duplicate_event = existing is not None
+            group = registry.fingerprints.get(fingerprint)
+            if group is None:
+                group = RegistryFingerprint(
+                    algorithm=fingerprint_algorithm,
+                    occurrence=1,
+                    symptom=symptom[:500],
+                    event_ids=[event_id],
+                )
+                registry.fingerprints[fingerprint] = group
+            elif not duplicate_event:
+                group.occurrence += 1
+                if event_id not in group.event_ids:
+                    group.event_ids.append(event_id)
+            if existing is None:
+                registry.events[event_id] = RegistryEvent(
+                    event_id=event_id,
+                    project_id=project_id,
+                    fingerprint=fingerprint,
+                    symptom=symptom[:500],
+                    first_seen=now,
+                    last_seen=now,
+                    run_ids=[run_id],
+                )
+            else:
+                existing.last_seen = now
+                if run_id not in existing.run_ids:
+                    existing.run_ids.append(run_id)
+                registry.events[event_id] = existing
+            registry.runs.append(
+                RegistryRun(
+                    run_id=run_id,
+                    event_id=event_id,
+                    project_id=project_id,
+                    status="needs_review",
+                    provider=provider,
+                    created_at=now,
+                    updated_at=now,
+                )
             )
-            registry.fingerprints[fingerprint] = group
-        elif not duplicate_event:
-            group.occurrence += 1
-            if event_id not in group.event_ids:
-                group.event_ids.append(event_id)
-        if existing is None:
-            registry.events[event_id] = RegistryEvent(
-                event_id=event_id,
-                project_id=project_id,
-                fingerprint=fingerprint,
-                symptom=symptom[:500],
-                first_seen=now,
-                last_seen=now,
-                run_ids=[run_id],
-            )
-        else:
-            existing.last_seen = now
-            if run_id not in existing.run_ids:
-                existing.run_ids.append(run_id)
-            registry.events[event_id] = existing
-        registry.runs.append(
-            RegistryRun(
-                run_id=run_id,
-                event_id=event_id,
-                project_id=project_id,
-                status="needs_review",
-                provider=provider,
-                created_at=now,
-                updated_at=now,
-            )
-        )
-        self.save(registry)
-        return group.occurrence, duplicate_event, fingerprint
+            self.save(registry)
+            return group.occurrence, duplicate_event, fingerprint
 
-    def set_run_status(self, run_id: str, status: RunStatus) -> None:
-        registry = self.load()
-        changed = False
-        for run in registry.runs:
-            if run.run_id == run_id:
+    def set_run_status(self, run_id: str, status: RunStatus, *, missing_ok: bool = False) -> None:
+        with exclusive_file_lock(self.path.with_suffix(".lock")):
+            registry = self.load()
+            run = next((item for item in registry.runs if item.run_id == run_id), None)
+            if run is None:
+                if not missing_ok:
+                    raise StoreError(f"run {run_id} is not registered")
+            elif run.status != status:
                 run.status = status
                 run.updated_at = utcnow()
-                changed = True
-        if not changed:
-            raise StoreError(f"run {run_id} is not registered")
-        self.save(registry)
+                self.save(registry)
 
     def duplicate_candidates(self, *, event_id: str, fingerprint: str) -> list[dict[str, str]]:
         registry = self.load()
@@ -438,7 +458,8 @@ class RunStore:
 
     # -- artifacts ----------------------------------------------------------
     def _artifact_path(self, name: str) -> Path:
-        if name not in ARTIFACT_NAMES and not name.startswith(
+        audit_path = re.fullmatch(r"outcome-audits/(?:[0-9a-f]{64}|\.pending)\.json", name)
+        if name not in ARTIFACT_NAMES and not audit_path and not name.startswith(
             ("evidence/snippets/", "evidence/objects/", "evidence/outcomes/")
         ):
             raise StoreError(f"artifact name is not allowed: {name}")
@@ -806,13 +827,16 @@ class LessonStore:
         atomic_write_json(self.path, LessonFile(lessons=lessons).model_dump(mode="json"))
 
     def upsert(self, lesson: Lesson) -> None:
-        lessons = {item.lesson_id: item for item in self.load()}
-        existing = lessons.get(lesson.lesson_id)
-        if existing is not None and existing.status == LessonStatus.VERIFIED and lesson.status == LessonStatus.CANDIDATE:
-            # Never downgrade a verified lesson implicitly.
-            return
-        lessons[lesson.lesson_id] = lesson
-        self.save(list(lessons.values()))
+        with exclusive_file_lock(self.path.with_suffix(".lock")):
+            lessons = {item.lesson_id: item for item in self.load()}
+            existing = lessons.get(lesson.lesson_id)
+            if existing == lesson:
+                return
+            if existing is not None and existing.status == LessonStatus.VERIFIED and lesson.status == LessonStatus.CANDIDATE:
+                # Never downgrade a verified lesson implicitly.
+                return
+            lessons[lesson.lesson_id] = lesson
+            self.save(list(lessons.values()))
 
     def search(self, query: str, limit: int = 5, *, rule_version: str | None = None) -> list[LessonSummary]:
         words = {word for word in re.findall(r"[A-Za-z_][A-Za-z0-9_.]{2,}", query.lower())}
